@@ -28,10 +28,10 @@
     "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
-      "@gspl/canon-foundation": ["./packages/canon-foundation/src/index.ts"],
-      "@gspl/canon-foundation/*": ["./packages/canon-foundation/src/*"],
-      "@gspl/gene-protocol": ["./packages/gene-protocol/src/index.ts"],
-      "@gspl/gene-protocol/*": ["./packages/gene-protocol/src/*"],
+      "@gspl/canon-foundation": ["./deps/gspl-canon/packages/canon-foundation/src/index.ts"],
+      "@gspl/canon-foundation/*": ["./deps/gspl-canon/packages/canon-foundation/src/*"],
+      "@gspl/gene-protocol": ["./deps/gspl-canon/packages/gene-protocol/src/index.ts"],
+      "@gspl/gene-protocol/*": ["./deps/gspl-canon/packages/gene-protocol/src/*"],
       "@gspl/agent-genes": ["./packages/agent-genes/src/index.ts"],
       "@gspl/agent-genes/*": ["./packages/agent-genes/src/*"],
       "@gspl/cognitive-kernel": ["./packages/cognitive-kernel/src/index.ts"],
@@ -69,5 +69,5 @@
     }
   },
   "include": ["packages/*/src/**/*.ts", "packages/*/test/**/*.ts", "adapters/*/src/**/*.ts"],
-  "exclude": ["node_modules", "**/dist", "**/coverage"]
+  "exclude": ["node_modules", "**/dist", "**/coverage", "deps"]
 }

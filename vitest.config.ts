@@ -4,8 +4,8 @@ import { resolve } from 'path';
 export default defineConfig({
   resolve: {
     alias: {
-      '@gspl/canon-foundation': resolve(__dirname, 'packages/canon-foundation/src/index.ts'),
-      '@gspl/gene-protocol': resolve(__dirname, 'packages/gene-protocol/src/index.ts'),
+      '@gspl/canon-foundation': resolve(__dirname, 'deps/gspl-canon/packages/canon-foundation/src/index.ts'),
+      '@gspl/gene-protocol': resolve(__dirname, 'deps/gspl-canon/packages/gene-protocol/src/index.ts'),
       '@gspl/agent-genes': resolve(__dirname, 'packages/agent-genes/src/index.ts'),
       '@gspl/cognitive-kernel': resolve(__dirname, 'packages/cognitive-kernel/src/index.ts'),
       '@gspl/intent-compiler': resolve(__dirname, 'packages/intent-compiler/src/index.ts'),

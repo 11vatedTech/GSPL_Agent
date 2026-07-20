@@ -1,0 +1,3 @@
+[submodule "deps/gspl-canon"]
+	path = deps/gspl-canon
+	url = https://github.com/11vatedTech/GSPL
