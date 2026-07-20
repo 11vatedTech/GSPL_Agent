@@ -53,7 +53,12 @@ export function createMemoryStore(): MemoryStore {
     nodes,
     edges,
     addNode(node) {
-      nodes.set(node.id, { ...node, created: Date.now(), lastAccessed: Date.now(), accessCount: 0 });
+      nodes.set(node.id, {
+        ...node,
+        created: node.created || Date.now(),
+        lastAccessed: node.lastAccessed || Date.now(),
+        accessCount: node.accessCount ?? 0,
+      });
     },
     getNode(id) {
       const node = nodes.get(id);

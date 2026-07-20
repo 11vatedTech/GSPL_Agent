@@ -6,7 +6,7 @@ const DEFAULT_POLICY: PolicyValue = {
   rules: [
     { id: 'r1', description: 'Read files', condition: { action: 'filesystem-read' }, effect: 'ALLOW', priority: 10, scope: ['filesystem'] },
     { id: 'r2', description: 'No network', condition: { action: 'network' }, effect: 'DENY', priority: 100, scope: ['network'] },
-    { id: 'r3', description: 'Allow inference', condition: {}, effect: 'ALLOW', priority: 5, scope: ['model'] },
+    { id: 'r3', description: 'Allow inference', condition: { action: 'model-inference' }, effect: 'ALLOW', priority: 5, scope: ['model'] },
   ],
   defaultEffect: 'DENY', version: 1, constitutionalInvariants: ['no-ambient-authority'],
 };
@@ -56,8 +56,9 @@ describe('Capability Security', () => {
   it('different policy = different capabilities', () => {
     const cm1 = createCapabilityManager(DEFAULT_POLICY);
     const cm2 = createCapabilityManager({ ...DEFAULT_POLICY, defaultEffect: 'ALLOW' });
-    expect(cm1.check('NETWORK_OUTBOUND', {}).authorized).toBe(false);
-    expect(cm2.check('NETWORK_OUTBOUND', {}).authorized).toBe(true);
+    // FILESYSTEM_DELETE matches no explicit rule -> falls to default
+    expect(cm1.check('FILESYSTEM_DELETE', {}).authorized).toBe(false);
+    expect(cm2.check('FILESYSTEM_DELETE', {}).authorized).toBe(true);
   });
 
   it('irreversible effects like delete are denied with default-deny', () => {

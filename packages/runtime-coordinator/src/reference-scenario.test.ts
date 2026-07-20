@@ -1,9 +1,19 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterAll } from 'vitest';
 import { createRuntimeCoordinator, type AgentSession } from './runtime-coordinator.js';
 import { createPrimordialGenome } from '@gspl/cognitive-kernel';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const TEST_DIR = mkdtempSync(join(tmpdir(), 'gspl-ref-scenario-'));
 
 function createSession(): AgentSession {
-  return createRuntimeCoordinator({ storagePath: ':memory:', schemaVersion: 1, backupEnabled: false }).createSession(createPrimordialGenome());
+  const coordinator = createRuntimeCoordinator({
+    storagePath: TEST_DIR,
+    schemaVersion: 1,
+    backupEnabled: false,
+  });
+  return coordinator.createSession(createPrimordialGenome());
 }
 
 describe('GSPL Agent — End-to-End Reference Scenario', () => {
@@ -11,8 +21,16 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
   let coordinator: ReturnType<typeof createRuntimeCoordinator>;
 
   beforeEach(() => {
-    coordinator = createRuntimeCoordinator({ storagePath: ':memory:', schemaVersion: 1, backupEnabled: false });
+    coordinator = createRuntimeCoordinator({
+      storagePath: TEST_DIR,
+      schemaVersion: 1,
+      backupEnabled: false,
+    });
     session = coordinator.createSession(createPrimordialGenome());
+  });
+
+  afterAll(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
   it('Step 1: Preserves original owner statement', () => {
@@ -43,8 +61,12 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
   it('Step 7: Different objectives produce structurally different phenotypes', () => {
     const s1 = createSession();
     const s2 = createSession();
-    const t1 = coordinator.executeTick(coordinator.submitObjective(s1, 'Analyze security'));
-    const t2 = coordinator.executeTick(coordinator.submitObjective(s2, 'Add two numbers'));
+    const t1 = createRuntimeCoordinator({ storagePath: TEST_DIR }).executeTick(
+      createRuntimeCoordinator({ storagePath: TEST_DIR }).submitObjective(s1, 'Analyze security')
+    );
+    const t2 = createRuntimeCoordinator({ storagePath: TEST_DIR }).executeTick(
+      createRuntimeCoordinator({ storagePath: TEST_DIR }).submitObjective(s2, 'Add two numbers')
+    );
     const types1 = new Set(t1.cognitiveGraph!.organs.map(o => o.contract.organType));
     const types2 = new Set(t2.cognitiveGraph!.organs.map(o => o.contract.organType));
     expect(types1.size !== types2.size || t1.cognitiveGraph!.edges.length !== t2.cognitiveGraph!.edges.length).toBe(true);
@@ -95,8 +117,12 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
 });
 
 describe('Deterministic properties', () => {
+  afterAll(() => {
+    try { rmSync(TEST_DIR, { recursive: true, force: true }); } catch {}
+  });
+
   it('Identical inputs produce identical phenotypes', () => {
-    const c = createRuntimeCoordinator({ storagePath: ':memory:' });
+    const c = createRuntimeCoordinator({ storagePath: TEST_DIR });
     const s1 = c.createSession(createPrimordialGenome());
     const s2 = c.createSession(createPrimordialGenome());
     const t1 = c.executeTick(c.submitObjective(s1, 'Count files'));

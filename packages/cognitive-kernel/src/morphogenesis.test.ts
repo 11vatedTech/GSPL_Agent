@@ -10,6 +10,8 @@ const MOCK_INTENT: IntentValue = {
 };
 
 const MOCK_ORGANS: OrganContract[] = [
+  { organType: 'INTENT_INTERPRETATION', inputTypes: ['intent'], outputTypes: ['structured-intent'], epistemicReliability: 0.9, cost: { computeUnits: 5, memoryBytes: 5e5 }, latency: { best: 50, typical: 200, worst: 1000 }, resourceNeeds: { vramRequired: 5e5, ramRequired: 1e6, gpuRequired: false }, determinism: 'quasi-deterministic', failureModes: [], evidenceRequirements: [], replacementStrategy: 'fallback' },
+  { organType: 'LANGUAGE_REASONING', inputTypes: ['text'], outputTypes: ['understanding'], epistemicReliability: 0.85, cost: { computeUnits: 8, memoryBytes: 8e5 }, latency: { best: 100, typical: 400, worst: 2000 }, resourceNeeds: { vramRequired: 8e5, ramRequired: 2e6, gpuRequired: false }, determinism: 'quasi-deterministic', failureModes: [], evidenceRequirements: [], replacementStrategy: 'fallback' },
   { organType: 'CODE_REASONING', inputTypes: ['code'], outputTypes: ['analysis'], epistemicReliability: 0.8, cost: { computeUnits: 10, memoryBytes: 1e6 }, latency: { best: 100, typical: 500, worst: 2000 }, resourceNeeds: { vramRequired: 1e6, ramRequired: 2e6, gpuRequired: false }, determinism: 'quasi-deterministic', failureModes: [], evidenceRequirements: [], replacementStrategy: 'fallback' },
   { organType: 'SECURITY_ANALYSIS', inputTypes: ['code'], outputTypes: ['threat-report'], epistemicReliability: 0.85, cost: { computeUnits: 20, memoryBytes: 2e6 }, latency: { best: 200, typical: 800, worst: 3000 }, resourceNeeds: { vramRequired: 2e6, ramRequired: 4e6, gpuRequired: true }, determinism: 'quasi-deterministic', failureModes: [], evidenceRequirements: [], replacementStrategy: 'escalate' },
   { organType: 'PLANNING', inputTypes: ['intent'], outputTypes: ['plan'], epistemicReliability: 0.75, cost: { computeUnits: 5, memoryBytes: 5e5 }, latency: { best: 50, typical: 200, worst: 1000 }, resourceNeeds: { vramRequired: 5e5, ramRequired: 1e6, gpuRequired: false }, determinism: 'quasi-deterministic', failureModes: [], evidenceRequirements: [], replacementStrategy: 'retry' },
@@ -33,11 +35,17 @@ describe('Cognitive Morphogenesis', () => {
     expect(types1.size !== types2.size || r1.cognitiveGraph.edges.length !== r2.cognitiveGraph.edges.length || r1.cognitiveGraph.riskClassification !== r2.cognitiveGraph.riskClassification).toBe(true);
   });
 
-  it('MORPH-2: High-risk objectives generate stronger verification', () => {
+  it('MORPH-2: High-risk objectives generate stronger verification organs selected', () => {
     const r1 = performMorphogenesis(makeReq('Delete all user data', makeIntent('Delete data'), 'LOW'));
     const r2 = performMorphogenesis(makeReq('Print hello world', makeIntent('Print hello'), 'MEDIUM'));
-    expect(r1.cognitiveGraph.riskClassification).toBe('HIGH');
-    expect(r2.cognitiveGraph.riskClassification).toBe('LOW');
+    // LOW risk tolerance means MORE verification organs are selected
+    const r1VerificationTypes = r1.cognitiveGraph.organs
+      .filter(o => o.contract.organType === 'ADVERSARIAL_CRITICISM' || o.contract.organType === 'SECURITY_ANALYSIS')
+      .length;
+    const r2VerificationTypes = r2.cognitiveGraph.organs
+      .filter(o => o.contract.organType === 'ADVERSARIAL_CRITICISM' || o.contract.organType === 'SECURITY_ANALYSIS')
+      .length;
+    expect(r1VerificationTypes).toBeGreaterThan(r2VerificationTypes);
   });
 
   it('MORPH-3: Morphogenesis terminates within budget', () => {

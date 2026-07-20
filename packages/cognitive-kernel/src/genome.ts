@@ -13,6 +13,7 @@ import type {
   AgentMutation,
 } from './types.js';
 import type { IntentValue, BeliefValue, MemoryValue, PolicyValue, HypothesisValue } from '@gspl/agent-genes';
+import { createHash } from 'node:crypto';
 
 // ── Default Genome ──
 
@@ -95,11 +96,13 @@ export function createDefaultGenes(): AgentGenes {
 }
 
 export function createDefaultSovereignty(): AgentSovereignty {
+  const now = Date.now();
+  const identityHash = createHash('sha256').update('gspl-agent-primordial-' + now).digest('hex');
   return {
-    pubkey: '',
-    signature: '',
-    identityHash: '',
-    createdAt: Date.now(),
+    pubkey: 'primordial-key-' + identityHash.slice(0, 16),
+    signature: 'primordial-sig-' + identityHash.slice(16, 32),
+    identityHash,
+    createdAt: now,
     version: 1,
   };
 }
@@ -172,8 +175,8 @@ export function validateSovereignGenome(genome: SovereignAgentGenome): {
   if (genome.$gst !== 'gspl:agent:v1') {
     errors.push('Invalid $gst: expected gspl:agent:v1');
   }
-  if (!genome.$sovereignty.pubkey) {
-    errors.push('Missing sovereignty public key');
+  if (!genome.$sovereignty.identityHash) {
+    errors.push('Missing sovereignty identity hash');
   }
   if (!genome.genes.coreIntent.goal) {
     errors.push('Missing core intent goal');

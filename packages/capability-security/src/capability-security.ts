@@ -175,15 +175,26 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
 function ruleMatches(rule: PolicyRule, effectType: EffectType, scope: CapabilityScope): boolean {
   const c = rule.condition;
 
+  // Guard: empty condition should NOT match anything
+  if (!c.action && !c.target && !c.dataSensitivity && !c.reversibility) return false;
+
   // Check action match
   if (c.action) {
     const actionMap: Record<string, EffectType[]> = {
       'filesystem-read': ['FILESYSTEM_READ'],
       'filesystem-write': ['FILESYSTEM_WRITE', 'FILESYSTEM_DELETE'],
       'network': ['NETWORK_OUTBOUND', 'NETWORK_INBOUND'],
+      'model-inference': ['MODEL_INFERENCE'],
+      'tool-use': ['TOOL_USE', 'SUB_AGENT_SPAWN'],
+      'memory': ['MEMORY_READ', 'MEMORY_WRITE'],
+      'process-exec': ['PROCESS_EXECUTE'],
+      'identity': ['IDENTITY_SIGN'],
+      'observability': ['OBSERVABILITY_EMIT'],
+      'configuration': ['CONFIGURATION_MODIFY'],
     };
     const allowed = actionMap[c.action];
-    if (allowed && !allowed.includes(effectType)) return false;
+    if (!allowed) return false; // Unknown action = no match
+    if (!allowed.includes(effectType)) return false;
   }
 
   // Check target match (path-based)

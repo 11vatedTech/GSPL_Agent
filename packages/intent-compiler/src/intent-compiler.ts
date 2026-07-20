@@ -315,13 +315,21 @@ function extractConstraints(input: string, lower: string): IntentConstraint[] {
 
 function extractAntiGoals(lower: string): string[] {
   const antiGoals: string[] = [];
-  const antiPatterns = [
-    ['don\'t delete', 'Do not delete any files'],
-    ['don\'t modify', 'Do not modify existing files without confirmation'],
-    ['don\'t break', 'Do not break existing functionality'],
+  const antiPatterns: [string, string][] = [
+    ["don't delete", 'Do not delete any files'],
+    ["do not delete", 'Do not delete any files'],
+    ["don't modify", 'Do not modify existing files without confirmation'],
+    ["do not modify", 'Do not modify existing files without confirmation'],
+    ["don't break", 'Do not break existing functionality'],
+    ["do not break", 'Do not break existing functionality'],
     ['no network', 'Do not make network requests'],
     ['no api', 'Do not call external APIs'],
     ['no changes to', 'Do not change specified targets'],
+    ['do not increase', 'Do not increase resource usage'],
+    ['do not add', 'Do not add new dependencies'],
+    ['do not remove', 'Do not remove existing features'],
+    ['without changing', 'Do not change the specified aspect'],
+    ['without modifying', 'Do not modify the specified targets'],
   ];
   for (const [pattern, antiGoal] of antiPatterns) {
     if (lower.includes(pattern)) antiGoals.push(antiGoal);
