@@ -83,10 +83,22 @@ describe('Failure & Rollback E2E', () => {
     const beforeStat = await readFile(targetPath, 'utf-8').catch(() => null);
     expect(beforeStat).toBeDefined();
 
-    // Now attempt rollback via action executor
+    // Now attempt rollback via the COORDINATOR's action executor (not a separate one)
+    // Execute a second write to capture before-state, then rollback
     const registry = createActionRegistry();
     registerStandardActions(registry);
     const executor = createActionExecutor(registry, { allowedRoots: [workspace] });
+
+    // Grant capability first
+    session.capabilityManager.grant({
+      name: 'rollback-test',
+      effectType: 'FILESYSTEM_WRITE',
+      scope: { path: workspace, toolName: 'fs-write' },
+      authority: 'OWNER',
+      requestedBy: 'owner-authority',
+      principalId: session.sessionId,
+      sessionId: session.sessionId,
+    });
 
     // Use the last created artifact for rollback
     const artResult = await executor.execute('fs-write',

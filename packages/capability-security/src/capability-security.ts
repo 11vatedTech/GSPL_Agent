@@ -30,6 +30,20 @@ export interface Capability {
   expiresAt: number | null;
   revokedAt: number | null;
   attenuation: AttenuationRule[];
+  /** The principal (agent/session) that holds this capability */
+  principalId: string;
+  /** The session that this capability was issued in */
+  sessionId: string;
+  /** ID of the plan node that requested this capability */
+  planNodeId?: string;
+  /** SHA-256 hash of the authorized action parameters */
+  parameterHash?: string;
+  /** ID of the intent that originated this capability request */
+  originatingIntentId?: string;
+  /** Lineage of delegation */
+  delegationLineage: string[];
+  /** Evidence of issuance (e.g., owner approval signature) */
+  issuanceEvidence?: Record<string, unknown>;
 }
 
 export type EffectType =
@@ -69,8 +83,33 @@ export interface CapabilityManager {
   capabilities: Map<string, Capability>;
   grant(request: CapabilityRequest): Capability;
   revoke(capabilityId: string): void;
-  check(effectType: EffectType, scope: CapabilityScope): AuthorizationResult;
+  check(effectType: EffectType, scope: CapabilityScope, principalId?: string, sessionId?: string): AuthorizationResult;
   delegate(capabilityId: string, to: string, attenuations: AttenuationRule[]): Capability;
+  /** Export all capability state for persistence */
+  exportState(): CapabilityState[];
+  /** Import capability state from persistence */
+  importState(state: CapabilityState[]): void;
+}
+
+export interface CapabilityState {
+  id: string;
+  name: string;
+  effectType: EffectType;
+  scope: CapabilityScope;
+  authority: AuthorityLevel;
+  delegated: boolean;
+  delegator: string | null;
+  createdAt: number;
+  expiresAt: number | null;
+  revokedAt: number | null;
+  attenuation: AttenuationRule[];
+  principalId: string;
+  sessionId: string;
+  planNodeId?: string;
+  parameterHash?: string;
+  originatingIntentId?: string;
+  delegationLineage: string[];
+  issuanceEvidence?: Record<string, unknown>;
 }
 
 export interface CapabilityRequest {
@@ -80,6 +119,11 @@ export interface CapabilityRequest {
   authority: AuthorityLevel;
   requestedBy: string;
   ttlMs?: number;
+  principalId?: string;
+  sessionId?: string;
+  planNodeId?: string;
+  parameterHash?: string;
+  originatingIntentId?: string;
 }
 
 export interface AuthorizationResult {
@@ -96,6 +140,10 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
   return {
     capabilities,
     grant(request) {
+      // Reject self-issued OWNER capabilities — only external authorities can issue OWNER
+      if (request.authority === 'OWNER' && request.requestedBy !== 'owner-authority' && request.requestedBy !== 'restore') {
+        throw new Error(`Self-issued OWNER capability denied: ${request.name} (requested by ${request.requestedBy}). Only owner-authority or restore can issue OWNER capabilities.`);
+      }
       const id = `cap-${Date.now().toString(36)}-${++capCounter}`;
       const capability: Capability = {
         id,
@@ -110,6 +158,13 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         expiresAt: request.ttlMs ? Date.now() + request.ttlMs : null,
         revokedAt: null,
         attenuation: [],
+        principalId: request.principalId ?? request.requestedBy,
+        sessionId: request.sessionId ?? '',
+        planNodeId: request.planNodeId,
+        parameterHash: request.parameterHash,
+        originatingIntentId: request.originatingIntentId,
+        delegationLineage: [],
+        issuanceEvidence: undefined,
       };
       capabilities.set(id, capability);
       return capability;
@@ -121,40 +176,58 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         capabilities.set(capabilityId, cap);
       }
     },
-    check(effectType, scope) {
+    check(effectType, scope, principalId?, sessionId?) {
       // FIRST: Check for a matching capability in the granted capabilities Map
-      // Possession of a valid (unrevoked, unexpired) capability overrides policy defaults
+      // Possession of a valid (unrevoked, unexpired) capability is REQUIRED
       for (const cap of capabilities.values()) {
         if (cap.revokedAt) continue;
         if (cap.expiresAt && cap.expiresAt < Date.now()) continue;
         if (cap.effectType !== effectType) continue;
-        // Scope matching: at minimum, toolName must match if both have it
-        if (scope.toolName && cap.scope.toolName && scope.toolName !== cap.scope.toolName) continue;
-        if (scope.path && cap.scope.path && !scope.path.startsWith(cap.scope.path)) continue;
+        // Principal/session binding check
+        if (principalId && cap.principalId !== principalId) continue;
+        if (sessionId && cap.sessionId !== sessionId) continue;
+        // Scope matching: toolName must match if both have it
+        if (scope.toolName && cap.scope.toolName && scope.toolName !== cap.scope.toolName) {
+          continue;
+        }
+        // Path scope: capability path must be a prefix of the requested path
+        if (scope.path && cap.scope.path) {
+          if (!scope.path.startsWith(cap.scope.path) && !cap.scope.path.startsWith(scope.path)) continue;
+        }
         return { authorized: true, reason: `Granted capability: ${cap.name}`, requiredApproval: false, matchedRule: undefined };
       }
 
-      // SECOND: Evaluate against policy rules
+      // SECOND: Evaluate against policy rules (policy alone is NOT sufficient for authorization)
       const sortedRules = [...policy.rules].sort((a, b) => b.priority - a.priority);
-
+      let policyAllowed = false;
       for (const rule of sortedRules) {
         if (ruleMatches(rule, effectType, scope)) {
           if (rule.effect === 'DENY') {
             return { authorized: false, reason: `Denied by policy: ${rule.description}`, requiredApproval: false, matchedRule: rule };
           }
           if (rule.effect === 'REQUIRE_APPROVAL') {
-            return { authorized: false, reason: `Requires approval: ${rule.description}`, requiredApproval: true, matchedRule: rule };
+            return { authorized: false, reason: `Requires approval AND capability possession: ${rule.description}`, requiredApproval: true, matchedRule: rule };
           }
           if (rule.effect === 'ALLOW') {
-            return { authorized: true, reason: `Allowed by policy: ${rule.description}`, requiredApproval: false, matchedRule: rule };
+            policyAllowed = true;
           }
         }
       }
 
+      // Policy ALLOW without a granted capability is NOT sufficient
+      if (policyAllowed) {
+        return {
+          authorized: false,
+          reason: 'Policy allows but no matching capability granted — possession-based authorization requires a valid granted capability',
+          requiredApproval: false,
+          matchedRule: undefined,
+        };
+      }
+
       // Default effect (only reaches here if no capability granted AND no rule matched)
       return {
-        authorized: policy.defaultEffect === 'ALLOW',
-        reason: policy.defaultEffect === 'DENY' ? 'No matching capability granted and default policy is DENY' : `Default policy: ${policy.defaultEffect}`,
+        authorized: false,
+        reason: 'No matching capability granted and no matching policy rule — authorization denied',
         requiredApproval: policy.defaultEffect === 'REQUIRE_APPROVAL',
         matchedRule: undefined,
       };
@@ -177,9 +250,67 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         expiresAt: parent.expiresAt,
         revokedAt: null,
         attenuation: [...parent.attenuation, ...attenuations],
+        principalId: to,
+        sessionId: parent.sessionId,
+        planNodeId: parent.planNodeId,
+        parameterHash: parent.parameterHash,
+        originatingIntentId: parent.originatingIntentId,
+        delegationLineage: [...parent.delegationLineage, parent.id],
+        issuanceEvidence: parent.issuanceEvidence,
       };
       capabilities.set(id, delegated);
       return delegated;
+    },
+
+    exportState(): CapabilityState[] {
+      return [...capabilities.values()].map(cap => ({
+        id: cap.id,
+        name: cap.name,
+        effectType: cap.effectType,
+        scope: cap.scope,
+        authority: cap.authority,
+        delegated: cap.delegated,
+        delegator: cap.delegator,
+        createdAt: cap.createdAt,
+        expiresAt: cap.expiresAt,
+        revokedAt: cap.revokedAt,
+        attenuation: cap.attenuation,
+        principalId: cap.principalId,
+        sessionId: cap.sessionId,
+        planNodeId: cap.planNodeId,
+        parameterHash: cap.parameterHash,
+        originatingIntentId: cap.originatingIntentId,
+        delegationLineage: cap.delegationLineage,
+        issuanceEvidence: cap.issuanceEvidence,
+      }));
+    },
+
+    importState(state: CapabilityState[]) {
+      capabilities.clear();
+      for (const s of state) {
+        const cap: Capability = {
+          id: s.id,
+          name: s.name,
+          description: '',
+          effectType: s.effectType,
+          scope: s.scope,
+          authority: s.authority,
+          delegated: s.delegated,
+          delegator: s.delegator,
+          createdAt: s.createdAt,
+          expiresAt: s.expiresAt,
+          revokedAt: s.revokedAt,
+          attenuation: s.attenuation,
+          principalId: s.principalId,
+          sessionId: s.sessionId,
+          planNodeId: s.planNodeId,
+          parameterHash: s.parameterHash,
+          originatingIntentId: s.originatingIntentId,
+          delegationLineage: s.delegationLineage,
+          issuanceEvidence: s.issuanceEvidence,
+        };
+        capabilities.set(cap.id, cap);
+      }
     },
   };
 }

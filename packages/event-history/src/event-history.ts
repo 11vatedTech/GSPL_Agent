@@ -58,6 +58,10 @@ export interface EventStore {
   reconstructState(sessionId: string, targetEventId: string): Record<string, unknown>;
   detectDivergence(events: ExecutionEvent[]): DivergenceReport;
   audit(sessionId: string): AuditReport;
+  /** Export all events for persistence */
+  exportState(): ExecutionEvent[];
+  /** Import events from persistence */
+  importState(events: ExecutionEvent[]): void;
 }
 
 export interface EventFilter {
@@ -144,6 +148,17 @@ export function createEventStore(): EventStore {
         unauthorizedAttempts: 0,
         auditTrail: sessionEvents.map(e => `${e.timestamp}: ${e.source}.${e.action} — ${e.result.success ? 'OK' : 'FAIL'}`),
       };
+    },
+
+    exportState(): ExecutionEvent[] {
+      return [...events];
+    },
+
+    importState(importedEvents: ExecutionEvent[]) {
+      events.length = 0;
+      for (const evt of importedEvents) {
+        events.push({ ...evt });
+      }
     },
   };
 }

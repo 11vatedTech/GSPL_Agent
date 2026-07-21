@@ -73,10 +73,21 @@ export interface EpistemicEngine {
   invalidateDependents(claims: Claim[], invalidatedClaimId: string): Claim[];
   calibrateConfidence(claim: Claim, observedAccuracy: number): Claim;
   claimToBelief(claim: Claim): BeliefValue;
+  /** Export all claims for persistence */
+  exportState(): EpistemicState;
+  /** Import claims from persistence */
+  importState(state: EpistemicState): void;
+}
+
+export interface EpistemicState {
+  claims: Claim[];
+  contradictions: Contradiction[];
 }
 
 export function createEpistemicEngine(): EpistemicEngine {
   let claimCounter = 0;
+  const claims: Claim[] = [];
+  const contradictions: Contradiction[] = [];
 
   function evidenceWeight(e: Evidence): number {
     switch (e.strength) {
@@ -115,7 +126,7 @@ export function createEpistemicEngine(): EpistemicEngine {
 
   return {
     createClaim(proposition, source, confidence, dependencies = []) {
-      return {
+      const claim: Claim = {
         id: `claim-${Date.now().toString(36)}-${++claimCounter}`,
         proposition,
         status: confidence > 0.95 ? 'KNOWN' : confidence > 0.7 ? 'BELIEVED' : 'INFERRED',
@@ -130,6 +141,8 @@ export function createEpistemicEngine(): EpistemicEngine {
         revisionHistory: [],
         verificationStatus: 'unverified',
       };
+      claims.push(claim);
+      return claim;
     },
 
     addEvidence(claim, evidence, supporting) {
@@ -160,9 +173,9 @@ export function createEpistemicEngine(): EpistemicEngine {
       };
     },
 
-    detectContradictions(claims) {
-      const contradictions: Contradiction[] = [];
-      const activeClaims = claims.filter(
+    detectContradictions(claimsToCheck) {
+      const found: Contradiction[] = [];
+      const activeClaims = claimsToCheck.filter(
         c => !['DISPROVEN', 'OBSOLETE', 'UNRESOLVED'].includes(c.status),
       );
 
@@ -176,7 +189,7 @@ export function createEpistemicEngine(): EpistemicEngine {
             a.proposition.includes('not ' + b.proposition) ||
             b.proposition.includes('not ' + a.proposition)
           ) {
-            contradictions.push({
+            found.push({
               claimA: a.id,
               claimB: b.id,
               description: `Direct contradiction: "${a.proposition}" vs "${b.proposition}"`,
@@ -187,7 +200,9 @@ export function createEpistemicEngine(): EpistemicEngine {
         }
       }
 
-      return contradictions;
+      contradictions.length = 0;
+      contradictions.push(...found);
+      return found;
     },
 
     expireEvidence(claim, evidenceId) {
@@ -259,6 +274,27 @@ export function createEpistemicEngine(): EpistemicEngine {
         validityInterval: claim.validityInterval,
         verificationStatus: claim.verificationStatus,
       };
+    },
+
+    exportState() {
+      return { claims: [...claims], contradictions: [...contradictions] };
+    },
+
+    importState(state) {
+      claims.length = 0;
+      if (Array.isArray(state.claims)) {
+        for (const c of state.claims) {
+          claims.push({ ...c });
+          if (c.id) {
+            const num = parseInt(c.id.split('-').pop() ?? '0', 36);
+            if (!isNaN(num) && num >= claimCounter) claimCounter = num + 1;
+          }
+        }
+      }
+      contradictions.length = 0;
+      if (Array.isArray(state.contradictions)) {
+        contradictions.push(...state.contradictions);
+      }
     },
   };
 }

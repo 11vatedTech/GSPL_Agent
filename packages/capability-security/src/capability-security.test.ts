@@ -27,6 +27,9 @@ describe('Capability Security', () => {
     const s2: CapabilityScope = {};
     const r1 = cm.check('FILESYSTEM_WRITE', s1);
     const r2 = cm.check('FILESYSTEM_WRITE', s2);
+    // Both should be denied (no capabilities granted)
+    expect(r1.authorized).toBe(false);
+    expect(r2.authorized).toBe(false);
     expect(r1.authorized).toBe(r2.authorized);
   });
 
@@ -37,6 +40,8 @@ describe('Capability Security', () => {
   });
 
   it('delegation cannot exceed parent authority', () => {
+    // Grant a capability first, then check
+    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority' });
     const pScope: CapabilityScope = { path: './src' };
     const cScope: CapabilityScope = { path: './src', toolName: 'child' };
     expect(cm.check('FILESYSTEM_READ', pScope).authorized).toBe(cm.check('FILESYSTEM_READ', cScope).authorized);
@@ -49,6 +54,8 @@ describe('Capability Security', () => {
   });
 
   it('known effect types are checked against rules', () => {
+    // Grant a capability first
+    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority' });
     const result = cm.check('FILESYSTEM_READ', { path: './src' });
     expect(result.reason.length).toBeGreaterThan(0);
   });
@@ -56,8 +63,14 @@ describe('Capability Security', () => {
   it('different policy = different capabilities', () => {
     const cm1 = createCapabilityManager(DEFAULT_POLICY);
     const cm2 = createCapabilityManager({ ...DEFAULT_POLICY, defaultEffect: 'ALLOW' });
+    // Both fail: policy alone is NOT sufficient without a granted capability
     // FILESYSTEM_DELETE matches no explicit rule -> falls to default
     expect(cm1.check('FILESYSTEM_DELETE', {}).authorized).toBe(false);
+    expect(cm2.check('FILESYSTEM_DELETE', {}).authorized).toBe(false);
+    // When a capability IS granted, both policies allow it (cm1 has matching rule, cm2 has default ALLOW)
+    cm1.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority' });
+    cm2.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority' });
+    expect(cm1.check('FILESYSTEM_DELETE', {}).authorized).toBe(true);
     expect(cm2.check('FILESYSTEM_DELETE', {}).authorized).toBe(true);
   });
 

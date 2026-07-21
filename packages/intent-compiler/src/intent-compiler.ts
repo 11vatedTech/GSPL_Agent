@@ -35,6 +35,22 @@ export interface CompiledIntent {
   unknowns: UnknownItem[];
   /** Intent lineage (can be revised later) */
   lineage: IntentLineage;
+  /** Typed artifact operations extracted from the statement */
+  artifactOperations: ArtifactOperationIntent[];
+}
+
+// ── Typed Artifact Intent ──
+
+export interface ArtifactOperationIntent {
+  operation: 'create' | 'read' | 'modify' | 'delete';
+  artifactType: 'file';
+  requestedPath: string;
+  requestedContent?: string;
+  encoding: 'utf-8' | 'binary';
+  overwritePolicy: 'deny' | 'allow' | 'require-approval';
+  sourceSpan: { start: number; end: number; originalText: string };
+  confidence: number;
+  ambiguities: string[];
 }
 
 export interface DerivedRequirement {
@@ -152,12 +168,16 @@ export function compileIntent(naturalLanguageInput: string): CompiledIntent {
     revisionConditions,
   };
 
+  // 14. Extract typed artifact operations
+  const artifactOperations = extractArtifactOperations(naturalLanguageInput, lower);
+
   return {
     originalStatement: naturalLanguageInput,
     intent,
     requirements,
     ambiguities,
     unknowns,
+    artifactOperations,
     lineage: {
       parentIntentHash: null,
       revisionNumber: 1,
@@ -498,4 +518,65 @@ function deriveRequirements(
   }
 
   return requirements;
+}
+
+// ── Artifact Operation Extraction ──
+
+function extractArtifactOperations(input: string, lower: string): ArtifactOperationIntent[] {
+  const operations: ArtifactOperationIntent[] = [];
+
+  // Determine operation type
+  let operation: ArtifactOperationIntent['operation'] = 'create';
+  if (lower.includes('read') || lower.includes('inspect') || lower.includes('examine')) operation = 'read';
+  else if (lower.includes('modify') || lower.includes('change') || lower.includes('update') || lower.includes('edit')) operation = 'modify';
+  else if (lower.includes('delete') || lower.includes('remove') || lower.includes('destroy')) operation = 'delete';
+  else if (lower.includes('create') || lower.includes('write') || lower.includes('make') || lower.includes('generate')) operation = 'create';
+
+  // Extract filename — look for quoted or keyword-bound paths
+  const filenamePatterns = [
+    /(?:named|called)\s+["']([^"']+)["']/i,
+    /(?:file|path)\s+["']([^"']+)["']/i,
+    /["']([^"']+\.[a-z]{2,6})["']/i,  // quoted path with extension
+    /(?:create|write|make|read|modify|delete|remove)\s+(?:a\s+)?(?:file\s+)?(?:named\s+)?["']?([^\s"']{1,100})["']?/i,
+  ];
+  let filename = '';
+  for (const pattern of filenamePatterns) {
+    const match = input.match(pattern);
+    if (match?.[1]) { filename = match[1].trim(); break; }
+  }
+
+  // Extract content — look for quoted strings after content indicators
+  const contentPatterns = [
+    /containing\s+["'](.+?)["']/i,
+    /with\s+(?:the\s+)?(?:message|content|text|body)\s+["'](.+?)["']/i,
+    /saying\s+["'](.+?)["']/i,
+    /write\s+["'](.+?)["']/i,
+    /["'](.{3,}?)["']/i,  // fallback: any quoted string of reasonable length
+  ];
+  let content = '';
+  for (const pattern of contentPatterns) {
+    const match = input.match(pattern);
+    if (match?.[1]) { content = match[1].trim(); break; }
+  }
+
+  const overwritePolicy: ArtifactOperationIntent['overwritePolicy'] =
+    lower.includes('no overwrite') || lower.includes("don't overwrite") || lower.includes('do not overwrite') ? 'deny' :
+    lower.includes('confirm') || lower.includes('ask') ? 'require-approval' : 'allow';
+
+  if (filename) {
+    const startIdx = input.indexOf(filename);
+    operations.push({
+      operation,
+      artifactType: 'file',
+      requestedPath: filename,
+      requestedContent: content || undefined,
+      encoding: 'utf-8',
+      overwritePolicy,
+      sourceSpan: { start: startIdx >= 0 ? startIdx : 0, end: (startIdx >= 0 ? startIdx : 0) + filename.length, originalText: filename },
+      confidence: 0.85,
+      ambiguities: content ? [] : ['No explicit content specified'],
+    });
+  }
+
+  return operations;
 }
