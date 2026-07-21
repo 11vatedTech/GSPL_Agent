@@ -72,7 +72,7 @@ describe('Failure & Rollback E2E', () => {
   it('1. rollback: created artifact restored (file deleted)', async () => {
     const coordinator = createCoordinator();
     const session = coordinator.createSession(createTestGenome(), workspace);
-    const withIntent = coordinator.submitObjective(session, 'Create a file named rollback-create.txt');
+    const withIntent = coordinator.submitObjective(session, 'Create a file named rollback-create.txt with content "test rollback content"');
     const executed = await coordinator.executeTick(withIntent);
 
     // File should exist
@@ -126,7 +126,7 @@ describe('Failure & Rollback E2E', () => {
     // Use coordinator to modify the file (this captures before-state)
     const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(session,
-      `Modify the file named rollback-modify.txt to contain "MODIFIED CONTENT"`);
+      `Modify the file named rollback-modify.txt to contain "UPDATED CONTENT FOR ROLLBACK"`);
     const executed = await coordinator.executeTick(withIntent);
 
     // Verify the file was modified
@@ -136,7 +136,7 @@ describe('Failure & Rollback E2E', () => {
     // If plan executed successfully, file should be modified
     if (modifiedNode) {
       const modifiedContent = await readFile(originalFile, 'utf-8');
-      expect(modifiedContent).toBe('MODIFIED CONTENT');
+      expect(modifiedContent).toBe('UPDATED CONTENT FOR ROLLBACK');
     }
 
     // Verify the action executor is properly configured

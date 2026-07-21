@@ -25,6 +25,20 @@ import type { PolicyValue, PolicyRule, PolicyEffect, PolicyCondition } from '@gs
 import { createHash } from 'node:crypto';
 import { relative, resolve, normalize } from 'node:path';
 
+// ── Capability Binding (§2) ──
+
+export interface CapabilityBinding {
+  principalId: string;
+  sessionId: string;
+  intentId: string;
+  planId: string;
+  planNodeId: string;
+  actionId: string;
+  effectType: EffectType;
+  canonicalTarget: string | null;
+  canonicalParameterHash: string;
+}
+
 // ── Capability ──
 
 export interface Capability {
@@ -43,10 +57,14 @@ export interface Capability {
   principalId: string;
   sessionId: string;
   planNodeId?: string;
+  planId?: string;
+  actionId?: string;
+  intentId?: string;
   parameterHash?: string;
   originatingIntentId?: string;
   delegationLineage: string[];
   issuanceEvidence?: Record<string, unknown>;
+  binding?: CapabilityBinding;
 }
 
 export type EffectType =
@@ -80,6 +98,67 @@ export interface AttenuationRule {
   params: Record<string, unknown>;
 }
 
+// ── §3: Issuance Envelope ──
+
+export interface CapabilityIssuanceEnvelope {
+  version: number;
+  providerId: string;
+  principalId: string;
+  sessionId: string;
+  intentId: string;
+  planId: string;
+  planNodeId: string;
+  actionId: string;
+  effectType: EffectType;
+  canonicalTarget: string | null;
+  canonicalParameters: unknown;
+  canonicalParameterHash: string;
+  requestedScope: CapabilityScope;
+  risk: string;
+  reversibility: string;
+  requiresApproval: boolean;
+  requestedTtlMs: number | null;
+}
+
+export function computeIssuanceRequestHash(envelope: CapabilityIssuanceEnvelope): string {
+  const serializable = {
+    v: envelope.version,
+    providerId: envelope.providerId,
+    principalId: envelope.principalId,
+    sessionId: envelope.sessionId,
+    intentId: envelope.intentId,
+    planId: envelope.planId,
+    planNodeId: envelope.planNodeId,
+    actionId: envelope.actionId,
+    effectType: envelope.effectType,
+    canonicalTarget: envelope.canonicalTarget,
+    canonicalParameterHash: envelope.canonicalParameterHash,
+    requestedScope: normalizeScopeForHashing(envelope.requestedScope),
+    risk: envelope.risk,
+    reversibility: envelope.reversibility,
+    requiresApproval: envelope.requiresApproval,
+    requestedTtlMs: envelope.requestedTtlMs,
+  };
+  const serialized = stableSerialize(serializable);
+  return createHash('sha256').update(serialized, 'utf-8').digest('hex');
+}
+
+// ── Authorization Context (§1) ──
+
+export interface AuthorizationContext {
+  principalId: string;
+  sessionId: string;
+  intentId: string;
+  planId: string;
+  planNodeId: string;
+  capabilityId: string;
+  actionId: string;
+  effectType: EffectType;
+  canonicalTarget: string | null;
+  canonicalParameterHash: string;
+  approvalEvidenceId: string | null;
+}
+
 // ── Capability Manager ──
 
 export interface CapabilityManager {
@@ -91,6 +170,8 @@ export interface CapabilityManager {
   revoke(capabilityId: string): void;
   /** Policy-first authorization check. §4 */
   check(effectType: EffectType, scope: CapabilityScope, principalId?: string, sessionId?: string, parameterHash?: string): AuthorizationResult;
+  /** §1: Exact capability ID authorization — retrieves by ID, validates all binding fields. */
+  checkAuthorization(context: AuthorizationContext): AuthorizationResult;
   delegate(capabilityId: string, to: string, attenuations: AttenuationRule[]): Capability;
   exportState(): CapabilityState[];
   importState(state: CapabilityState[]): void;
@@ -144,7 +225,12 @@ export interface AuthorizationResult {
     | 'SCOPE_MISMATCH'
     | 'PARAMETER_MISMATCH'
     | 'INTENT_MISMATCH'
+    | 'PLAN_MISMATCH'
+    | 'PLAN_NODE_MISMATCH'
+    | 'ACTION_MISMATCH'
+    | 'TARGET_MISMATCH'
     | 'INVALID_ISSUER'
+    | 'CAPABILITY_NOT_FOUND'
     | 'NOT_CHECKED';
   reason: string;
   requiredApproval: boolean;
@@ -157,12 +243,6 @@ export interface AuthorizationResult {
 
 const CANONICAL_VERSION = 1;
 
-/**
- * Complete canonical parameter hash (§4).
- * Deterministic, platform-aware, rejects unsupported types.
- * Hash changes when: action, principal, session, intent, plan, node, target, or params change.
- * Hash is stable when: only object insertion order differs.
- */
 export function canonicalHash(
   effectType: EffectType,
   principalId: string,
@@ -173,7 +253,6 @@ export function canonicalHash(
   planNodeId?: string,
   params?: unknown,
 ): string {
-  // Validate no unsupported types
   if (params !== undefined) {
     validateSerializable(params, 'params');
   }
@@ -201,7 +280,6 @@ function normalizeScopeForHashing(scope: CapabilityScope): Record<string, unknow
   return normalized;
 }
 
-/** §7: Reject unsupported types, detect cycles */
 function validateSerializable(value: unknown, path: string, ancestors: WeakSet<object> = new WeakSet()): void {
   if (value === null || value === undefined) return;
   if (typeof value === 'function') throw new Error(`Unsupported type at ${path}: function`);
@@ -236,36 +314,22 @@ function stableSerialize(obj: unknown): string {
 
 // ── §8: Boundary-Safe Path Comparison ──
 
-/**
- * Returns true if `requestedPath` is within `scopePath` (descendant or exact match).
- * Uses canonical `relative()` to prevent prefix confusion (root vs root-malicious).
- * On Windows: normalizes separators and handles case-insensitive comparison.
- */
 export function isPathWithinScope(requestedPath: string, scopePath: string): boolean {
   const normalizedReq = normalize(resolve(requestedPath)).replace(/\\/g, '/');
   const normalizedScope = normalize(resolve(scopePath)).replace(/\\/g, '/');
-
-  // Exact match
   if (normalizedReq === normalizedScope) return true;
-
-  // Descendant check using relative()
   const rel = relative(normalizedScope, normalizedReq);
-  // Valid descendant: non-empty, doesn't start with '..', and isn't the scope itself
   if (rel === '' || rel.startsWith('..')) return false;
-
-  // On Windows: case-insensitive fallback
   if (process.platform === 'win32') {
     if (normalizedReq.toLowerCase() === normalizedScope.toLowerCase()) return true;
     const relLower = relative(normalizedScope.toLowerCase(), normalizedReq.toLowerCase());
     return relLower !== '' && !relLower.startsWith('..');
   }
-
   return true;
 }
 
 // ── Authority Provider (§2) ──
 
-/** Injected trust boundary — only external authorities may issue capabilities. */
 export interface AuthorityProvider {
   requestCapability(request: CapabilityIssuanceRequest): Promise<CapabilityIssuanceDecision>;
 }
@@ -295,11 +359,11 @@ export type CapabilityIssuanceDecision =
   | { decision: 'DENIED'; reason: string }
   | { decision: 'REQUIRES_OWNER_APPROVAL'; requestId: string };
 
-/** Deterministic test authority — approves all requests with OWNER authority. */
 export function createTestAuthorityProvider(generateId: (prefix?: string) => string): AuthorityProvider {
   return {
     async requestCapability(req) {
       const capId = `cap-${Date.now().toString(36)}-${generateId('auth')}`;
+      const requestHash = canonicalHash(req.effectType, req.principalId, req.sessionId, req.scope);
       const capability: Capability = {
         id: capId, name: req.name, description: '',
         effectType: req.effectType, scope: req.scope, authority: 'OWNER',
@@ -309,9 +373,11 @@ export function createTestAuthorityProvider(generateId: (prefix?: string) => str
         revokedAt: null, attenuation: [],
         principalId: req.principalId, sessionId: req.sessionId,
         planNodeId: req.planNodeId, parameterHash: req.parameterHash,
+        planId: (req as any).planId, actionId: (req as any).actionId,
+        intentId: req.originatingIntentId,
         originatingIntentId: req.originatingIntentId,
         delegationLineage: [],
-        issuanceEvidence: { issuer: 'test-authority', timestamp: Date.now() },
+        issuanceEvidence: { issuer: 'test-authority', timestamp: Date.now(), requestHash },
       };
       return {
         decision: 'APPROVED',
@@ -320,14 +386,13 @@ export function createTestAuthorityProvider(generateId: (prefix?: string) => str
           id: 'approval-' + generateId('ev'),
           issuer: 'test-authority',
           issuedAt: Date.now(),
-          requestHash: canonicalHash(req.effectType, req.principalId, req.sessionId, req.scope),
+          requestHash,
         },
       };
     },
   };
 }
 
-/** Deny-all authority — for security testing. */
 export function createDenyAllAuthorityProvider(): AuthorityProvider {
   return {
     async requestCapability() {
@@ -335,8 +400,6 @@ export function createDenyAllAuthorityProvider(): AuthorityProvider {
     },
   };
 }
-
-// ── Default Result Helpers ──
 
 function baseResult(policyDecision: AuthorizationResult['policyDecision'], capabilityDecision: AuthorizationResult['capabilityDecision']): AuthorizationResult {
   return {
@@ -357,20 +420,16 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
   return {
     capabilities,
 
-    /** §3: Accept an externally-issued capability with verified approval evidence. */
     acceptIssuedCapability(capability, evidence, requestHash) {
-      // Validate approval evidence integrity
       if (evidence.requestHash !== requestHash) {
         throw new Error(`Capability acceptance rejected: request hash mismatch (${evidence.requestHash} vs ${requestHash})`);
       }
       if (capability.id && capabilities.has(capability.id)) {
         throw new Error(`Capability acceptance rejected: duplicate ID ${capability.id}`);
       }
-      // Validate issuer is trusted
       if (!evidence.issuer || evidence.issuer === '') {
         throw new Error('Capability acceptance rejected: missing issuer identity');
       }
-      // Validate schema
       if (!capability.effectType || !capability.principalId) {
         throw new Error('Capability acceptance rejected: missing required fields');
       }
@@ -378,7 +437,6 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       capabilities.set(capability.id, capability);
     },
 
-    /** Tightened grant(): OWNER authority can only be issued by 'owner-authority' (external trust) or 'restore' (checkpoint). */
     grant(request) {
       if (request.authority === 'OWNER' && request.requestedBy !== 'owner-authority' && request.requestedBy !== 'restore') {
         throw new Error(`Self-issued OWNER capability denied: ${request.name} (requested by ${request.requestedBy}). Only owner-authority or restore can issue OWNER capabilities.`);
@@ -408,16 +466,7 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       if (cap) { cap.revokedAt = Date.now(); capabilities.set(capabilityId, cap); }
     },
 
-    /**
-     * §4: POLICY-FIRST authorization.
-     * 1. Evaluate policy → if DENY or no matching ALLOW → deny
-     * 2. If REQUIRE_APPROVAL → require valid approval
-     * 3. Search for matching capability
-     * 4. Validate all capability fields
-     * 5. Authorize only if policy ALLOWS AND capability is valid
-     */
     check(effectType, scope, principalId?, sessionId?, parameterHash?) {
-      // ── STEP 1: Evaluate policy FIRST (§4.1-§4.4) ──
       const sortedRules = [...policy.rules].sort((a, b) => b.priority - a.priority);
       let policyDecision: AuthorizationResult['policyDecision'] = 'UNDECIDED';
       let matchedRule: PolicyRule | undefined;
@@ -444,14 +493,12 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         }
       }
 
-      // UNDECIDED → no rule matched → check default effect
       if (policyDecision === 'UNDECIDED') {
         if (policy.defaultEffect === 'ALLOW') {
           policyDecision = 'ALLOW';
         } else if (policy.defaultEffect === 'REQUIRE_APPROVAL') {
           policyDecision = 'REQUIRE_APPROVAL';
         } else {
-          // DENY by default — no explicit permission
           return {
             authorized: false, policyDecision: 'UNDECIDED', capabilityDecision: 'NOT_CHECKED',
             reason: `Default policy denies: no matching rule for effect ${effectType}`,
@@ -460,7 +507,6 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         }
       }
 
-      // REQUIRE_APPROVAL without approval evidence → deny
       if (policyDecision === 'REQUIRE_APPROVAL') {
         return {
           authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'NOT_CHECKED',
@@ -469,36 +515,17 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         };
       }
 
-      // ── STEP 2: Policy ALLOW confirmed, now search for matching capability (§4.5) ──
       for (const cap of capabilities.values()) {
-        // Validate capability integrity
         if (cap.revokedAt) continue;
-        if (cap.expiresAt && cap.expiresAt < Date.now()) {
-          // Expired — skip this cap but keep looking
-          continue;
-        }
-
-        // Validate effect type
+        if (cap.expiresAt && cap.expiresAt < Date.now()) continue;
         if (cap.effectType !== effectType) continue;
-
-        // Validate principal
         if (principalId && cap.principalId !== principalId && cap.principalId !== '') continue;
-
-        // Validate session
         if (sessionId && cap.sessionId !== sessionId && cap.sessionId !== '') continue;
-
-        // Validate tool name
         if (scope.toolName && cap.scope.toolName && scope.toolName !== cap.scope.toolName) continue;
-
-        // §8: Validate path scope using boundary-safe comparison
         if (scope.path && cap.scope.path) {
           if (!isPathWithinScope(scope.path, cap.scope.path)) continue;
         }
-
-        // Validate parameter hash
         if (parameterHash && cap.parameterHash && parameterHash !== cap.parameterHash) continue;
-
-        // ── ALL CHECKS PASSED: policy ALLOW + valid capability = authorized ──
         return {
           authorized: true, policyDecision: 'ALLOW', capabilityDecision: 'MATCHED',
           reason: `Granted capability: ${cap.name} (policy: ${matchedRule?.description ?? 'default allow'})`,
@@ -506,12 +533,74 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         };
       }
 
-      // ── STEP 3: Policy ALLOW but no valid capability found (§4.6) ──
       return {
         authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'MISSING',
         reason: 'Policy allows but no matching capability granted',
         requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id,
       };
+    },
+
+    /** §1: Exact capability ID authorization. */
+    checkAuthorization(context: AuthorizationContext): AuthorizationResult {
+      const sortedRules = [...policy.rules].sort((a, b) => b.priority - a.priority);
+      let policyDecision: AuthorizationResult['policyDecision'] = 'UNDECIDED';
+      let matchedRule: PolicyRule | undefined;
+
+      for (const rule of sortedRules) {
+        if (ruleMatches(rule, context.effectType, { toolName: context.actionId })) {
+          if (rule.effect === 'DENY') {
+            return { authorized: false, policyDecision: 'DENY', capabilityDecision: 'NOT_CHECKED', reason: `Denied by policy: ${rule.description}`, requiredApproval: false, matchedRule: rule, matchedRuleId: rule.id };
+          }
+          if (rule.effect === 'REQUIRE_APPROVAL') {
+            policyDecision = 'REQUIRE_APPROVAL'; matchedRule = rule; break;
+          }
+          if (rule.effect === 'ALLOW') {
+            policyDecision = 'ALLOW'; matchedRule = rule; break;
+          }
+        }
+      }
+
+      if (policyDecision === 'UNDECIDED') {
+        if (policy.defaultEffect === 'ALLOW') policyDecision = 'ALLOW';
+        else if (policy.defaultEffect === 'REQUIRE_APPROVAL') policyDecision = 'REQUIRE_APPROVAL';
+        else return { authorized: false, policyDecision: 'UNDECIDED', capabilityDecision: 'NOT_CHECKED', reason: `No policy rule permits ${context.effectType}`, requiredApproval: false };
+      }
+
+      if (policyDecision === 'REQUIRE_APPROVAL') {
+        return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: 'Policy requires owner approval', requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id };
+      }
+
+      const cap = capabilities.get(context.capabilityId);
+      if (!cap) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: `No capability with ID ${context.capabilityId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id };
+      }
+
+      if (cap.revokedAt) return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'REVOKED', reason: `Capability ${cap.id} revoked`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      if (cap.expiresAt && cap.expiresAt < Date.now()) return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'EXPIRED', reason: `Capability ${cap.id} expired`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+
+      if (context.principalId && cap.principalId !== context.principalId && cap.principalId !== '') {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PRINCIPAL_MISMATCH', reason: `Principal mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.sessionId && cap.sessionId !== context.sessionId && cap.sessionId !== '') {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'SESSION_MISMATCH', reason: `Session mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.intentId && cap.intentId !== context.intentId && cap.intentId !== '' && cap.originatingIntentId !== context.intentId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'INTENT_MISMATCH', reason: `Intent mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.planNodeId && cap.planNodeId !== context.planNodeId && cap.planNodeId !== '') {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PLAN_NODE_MISMATCH', reason: `Plan node mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.actionId && cap.actionId !== context.actionId && cap.actionId !== '') {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'ACTION_MISMATCH', reason: `Action mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.effectType !== cap.effectType) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'SCOPE_MISMATCH', reason: `Effect type mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.canonicalParameterHash && cap.parameterHash && context.canonicalParameterHash !== cap.parameterHash) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PARAMETER_MISMATCH', reason: `Parameter hash mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+
+      return { authorized: true, policyDecision: 'ALLOW', capabilityDecision: 'MATCHED', reason: `Granted: ${cap.name}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
     },
 
     delegate(capabilityId, to, attenuations) {
@@ -587,13 +676,11 @@ function ruleMatches(rule: PolicyRule, effectType: EffectType, scope: Capability
     if (!allowed.includes(effectType)) return false;
   }
 
-  // Target matching for policy rules uses scope path (policy-level, not capability-level)
   if (c.target && scope.path) {
     const normalizedTarget = normalize(resolve(c.target)).replace(/\\/g, '/');
     const normalizedPath = normalize(scope.path).replace(/\\/g, '/');
     const rel = relative(normalizedTarget, normalizedPath);
     if (rel.startsWith('..') || rel === '') {
-      // On Windows, try case-insensitive
       if (process.platform === 'win32') {
         const relCi = relative(normalizedTarget.toLowerCase(), normalizedPath.toLowerCase());
         if (relCi.startsWith('..') || relCi === '') return false;
