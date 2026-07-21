@@ -29,7 +29,7 @@ import { createTransactionManager, type TransactionManager } from '@gspl/transac
 import { createPersistenceLayer, type PersistenceLayer, type PersistenceConfig, type PersistedState } from '@gspl/persistence';
 import { createEventStore, type EventStore, type ExecutionEvent } from '@gspl/event-history';
 import { createObservabilitySystem, type ObservabilitySystem } from '@gspl/observability';
-import { createVerificationEngine, type VerificationEngine } from '@gspl/verification-engine';
+import { createVerificationEngine, type VerificationEngine, type VerificationResult } from '@gspl/verification-engine';
 import type { IntentValue } from '@gspl/agent-genes';
 
 // ── Runtime Configuration ──
@@ -311,66 +311,178 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
   registerOrgan({
     organType: 'FILESYSTEM_EXECUTION',
     handler: async (_organ, session) => {
-      const planNode = session.executionPlan?.nodes.find(n => n.status === 'READY');
-      return {
-        output: { executed: !!planNode, planNodeId: planNode?.id ?? null },
-        confidence: 0.8,
-        evidence: planNode ? [`Executing plan node: ${planNode.id}`] : ['No ready plan nodes'],
-        errors: [],
-        consumedResources: { computeUnits: 3, memoryBytes: 0 },
-      };
+      // Use the action executor for real filesystem operations
+      // If no execution plan exists, return organ-unavailable with context
+      if (!session.executionPlan) {
+        return {
+          output: {
+            executed: false,
+            reason: 'No execution plan set — use PLANNING organ first',
+            planNodeId: null,
+          },
+          confidence: 0,
+          evidence: [],
+          errors: [{
+            code: 'NO_EXECUTION_PLAN',
+            message: 'FILESYSTEM_EXECUTION requires an execution plan. Submit a plan first via the PLANNING organ.',
+            severity: 'error',
+            recoverable: true,
+          }],
+          consumedResources: { computeUnits: 0, memoryBytes: 0 },
+        };
+      }
+      const readyNodes = session.executionPlan.nodes.filter(n => n.status === 'READY');
+      if (readyNodes.length === 0) {
+        return {
+          output: { executed: false, reason: 'No ready plan nodes', planNodeId: null },
+          confidence: 0.5,
+          evidence: [],
+          errors: [{ code: 'NO_READY_NODES', message: 'No plan nodes in READY state', severity: 'warning', recoverable: true }],
+          consumedResources: { computeUnits: 0, memoryBytes: 0 },
+        };
+      }
+      // Execute the first ready node through the action fabric
+      const node = readyNodes[0];
+      try {
+        const result = await actionExecutor.execute(node.id, { planNode: node }, session.capabilityManager);
+        return {
+          output: { executed: result.success, planNodeId: node.id, result },
+          confidence: result.success ? 0.9 : 0.0,
+          evidence: result.success ? [`Executed plan node ${node.id}`] : [],
+          errors: result.errors.map(e => ({ code: e.code, message: e.message, severity: e.severity as 'warning' | 'error' | 'fatal', recoverable: e.recoverable })),
+          consumedResources: { computeUnits: 3, memoryBytes: result.resourceUsed.memoryBytes },
+        };
+      } catch (e) {
+        return {
+          output: { executed: false, planNodeId: node.id, error: e instanceof Error ? e.message : 'unknown' },
+          confidence: 0,
+          evidence: [],
+          errors: [{ code: 'EXECUTION_FAILED', message: e instanceof Error ? e.message : 'Unknown execution error', severity: 'fatal', recoverable: false }],
+          consumedResources: { computeUnits: 3, memoryBytes: 0 },
+        };
+      }
     },
-    inputSchema: { planNode: 'PlanNode' },
+    inputSchema: { planNode: 'PlanNode', actionExecutor: 'ActionExecutor' },
     outputSchema: { executed: 'boolean' },
     requiredCapabilities: ['FILESYSTEM_WRITE'],
   });
 
   registerOrgan({
     organType: 'OBSERVATION',
-    handler: async (_organ, _session) => {
+    handler: async (_organ, session) => {
+      // Observe actual cognitive execution results — not canned
+      const organOutputs: Array<{ id: string; type: string; confidence: number; evidence: string[] }> = [];
+      if (session.cognitiveGraph) {
+        for (const o of session.cognitiveGraph.organs) {
+          if (o.result) {
+            organOutputs.push({
+              id: o.id,
+              type: o.contract.organType,
+              confidence: o.result.confidence,
+              evidence: o.result.evidence,
+            });
+          }
+        }
+      }
+      const observed = organOutputs.length > 0;
       return {
-        output: { observed: true, timestamp: clock() },
-        confidence: 0.95,
-        evidence: ['Observation completed'],
-        errors: [],
+        output: {
+          observed,
+          organCount: organOutputs.length,
+          organs: organOutputs,
+          timestamp: clock(),
+        },
+        confidence: observed ? 0.95 : 0.0,
+        evidence: observed ? [`Observed ${organOutputs.length} organ outputs`] : ['No organ outputs to observe'],
+        errors: observed ? [] : [{ code: 'NOTHING_OBSERVED', message: 'No cognitive organs produced observable output', severity: 'warning', recoverable: true }],
         consumedResources: { computeUnits: 1, memoryBytes: 0 },
       };
     },
-    inputSchema: {},
-    outputSchema: { observed: 'boolean' },
+    inputSchema: { cognitiveGraph: 'CognitiveGraph' },
+    outputSchema: { observed: 'boolean', organCount: 'number' },
     requiredCapabilities: [],
   });
 
   registerOrgan({
     organType: 'EPISTEMIC_UPDATE',
     handler: async (_organ, session) => {
-      const claimCount = 0; // Claims tracked by epistemic engine
+      // Create real epistemic claims from organ outputs
+      let claimCount = 0;
+      if (session.cognitiveGraph) {
+        for (const o of session.cognitiveGraph.organs) {
+          if (o.result && o.status === 'COMPLETED') {
+            try {
+              session.epistemicEngine.createClaim(
+                JSON.stringify(o.result.output),
+                { type: 'observation', identifier: o.id, reliability: o.result.confidence, description: `Organ ${o.contract.organType} output` },
+                o.result.confidence,
+              );
+              claimCount++;
+            } catch { /* non-critical */ }
+          }
+        }
+      }
       return {
-        output: { claimsUpdated: claimCount, epistemicStatus: 'updated' },
-        confidence: 0.9,
-        evidence: ['Epistemic state updated'],
+        output: { claimsUpdated: claimCount, epistemicStatus: claimCount > 0 ? 'updated' : 'empty' },
+        confidence: claimCount > 0 ? 0.9 : 0.3,
+        evidence: claimCount > 0 ? [`Created ${claimCount} epistemic claims from organ outputs`] : ['No organ outputs to create claims from'],
         errors: [],
         consumedResources: { computeUnits: 1, memoryBytes: 0 },
       };
     },
-    inputSchema: { claims: 'Claim[]' },
+    inputSchema: { cognitiveGraph: 'CognitiveGraph' },
     outputSchema: { claimsUpdated: 'number' },
     requiredCapabilities: [],
   });
 
   registerOrgan({
     organType: 'VERIFICATION',
-    handler: async (_organ, _session) => {
+    handler: async (_organ, session) => {
+      // Run actual validators against cognitive execution evidence
+      const results: VerificationResult[] = [];
+
+      // Verify organs completed
+      if (session.cognitiveGraph) {
+        const organsStatus = session.cognitiveGraph.organs.map(o => ({ status: o.status, id: o.id }));
+        const orgResult = await verification.runValidator('organs-completed', { actual: organsStatus });
+        results.push(orgResult);
+      }
+
+      // Verify completion evidence
+      const intent = session.compiledIntent?.intent;
+      if (intent?.completionEvidence) {
+        for (const evidence of intent.completionEvidence) {
+          const hasEvidence = session.cognitiveGraph?.organs.some(
+            o => o.status === 'COMPLETED' && o.result?.evidence?.some(e => e.includes(evidence))
+          );
+          const predResult = await verification.runValidator('predicate-true', { actual: hasEvidence });
+          results.push(predResult);
+        }
+      }
+
+      // Check for fatal errors
+      const fatalErrors = session.errors.filter(e => e.severity === 'fatal' && !e.recoverable);
+      if (fatalErrors.length > 0) {
+        const errResult = await verification.runValidator('predicate-true', { actual: false });
+        results.push(errResult);
+      }
+
+      const allPassed = results.length > 0 && results.every(r => r.passed);
       return {
-        output: { verified: true, checkCount: 0 },
-        confidence: 0.85,
-        evidence: ['Verification pass — no blockers'],
-        errors: [],
+        output: {
+          verified: allPassed,
+          checkCount: results.length,
+          passed: results.filter(r => r.passed).length,
+          failed: results.filter(r => !r.passed).length,
+        },
+        confidence: allPassed ? 0.9 : 0.5,
+        evidence: [`Verification ran ${results.length} checks: ${results.filter(r => r.passed).length} passed, ${results.filter(r => !r.passed).length} failed`],
+        errors: allPassed ? [] : results.filter(r => !r.passed).flatMap(r => r.errors.map(e => ({ code: e.code, message: e.message, severity: e.severity as 'warning' | 'error' | 'fatal', recoverable: true }))),
         consumedResources: { computeUnits: 2, memoryBytes: 0 },
       };
     },
-    inputSchema: { completionCriteria: 'string[]' },
-    outputSchema: { verified: 'boolean' },
+    inputSchema: { session: 'AgentSession' },
+    outputSchema: { verified: 'boolean', checkCount: 'number' },
     requiredCapabilities: [],
   });
 

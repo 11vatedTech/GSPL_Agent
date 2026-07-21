@@ -20,8 +20,8 @@ describe('Verification Engine', () => {
     expect(result.errors.length).toBeGreaterThan(0);
   });
 
-  it('verifies artifact existence', () => {
-    const result = ve.verifyArtifactExists('./package.json');
+  it('verifies artifact existence (async)', async () => {
+    const result = await ve.verifyArtifactExists('./package.json');
     expect(result.passed).toBeDefined();
     expect(result.type).toBe('ARTIFACT_EXISTENCE');
   });
