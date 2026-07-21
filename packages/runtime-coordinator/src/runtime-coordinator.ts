@@ -174,7 +174,7 @@ export function createTestRuntimeCoordinator(overrides?: Partial<RuntimeDependen
   registerStandardActions(baseRegistry);
   return createRuntimeCoordinator({
     authorityProvider: createTestAuthorityProvider(baseGenerateId),
-    persistence: createPersistenceLayer({ storagePath: './.gspl-test-state', schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, compressionEnabled: false }),
+    persistence: createPersistenceLayer({ storagePath: join(tmpdir(), 'gspl-test-state-' + baseGenerateId('persist')), schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, compressionEnabled: false }),
     eventStore: createEventStore(),
     observability: createObservabilitySystem(),
     verification: createVerificationEngine(),
@@ -477,31 +477,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           actionId: 'fs-delete',
           actionParams: { path: join(workspace, deleteFilename) },
         });
-      } else if (goal.includes('analyze') || goal.includes('inspect') || goal.includes('examine')) {
-        // Analysis-only intent — no file writes
-        nodes.push({
-          id: generateId('plan-node-analyze'),
-          objective: 'Analyze the target',
-          preconditions: [],
-          dependencies: [],
-          requiredCapabilities: [{ effectType: 'FILESYSTEM_READ' as EffectType, scope: { toolName: 'fs-read' } }],
-          authority: 'owner-authorized',
-          inputArtifacts: [],
-          expectedOutputs: ['analysis-result'],
-          effects: [{ type: 'analysis', description: 'Analyze target', target: intent.scope?.[0] ?? 'Unknown', expectedOutcome: 'Analysis complete' }],
-          risk: 'LOW',
-          reversibility: 'reversible',
-          resourceBudget: { maxComputeUnits: 1, maxMemoryBytes: 1024 * 1024, maxTimeMs: 10000 },
-          timeoutMs: 30000,
-          retryPolicy: { maxRetries: 1, backoffMs: 100, retryOn: [] },
-          validation: ['analysis-complete'],
-          rollback: null,
-          requiresApproval: false,
-          status: 'READY',
-          actionId: 'fs-read',
-          actionParams: { path: join(workspace, intent.scope?.[0] ?? 'unknown') },
-        });
-      // No valid operation found — reject with UNRESOLVED_INTENT (§6)
+      // §14: No NL analysis fallback — reject when no typed operation exists
       return {
         output: { planGenerated: false, reason: 'No valid typed artifact operation for this intent' },
         confidence: 0, evidence: [],
@@ -595,7 +571,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           intentId: session.compiledIntent?.intent.goal ?? '',
           planId: session.executionPlan?.id ?? '',
           planNodeId: node.id,
-          capabilityId: '',
+          capabilityId: (node as any)._issuedCapabilityId || node.id,
           actionId,
           effectType,
           canonicalTarget: (params as any)?.path ?? null,
@@ -1252,6 +1228,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                         decision.approvalEvidence,
                         decision.approvalEvidence.requestHash,
                       );
+                      // §4: Store the actual capability ID on the plan node for later auth context binding
+                      (node as any)._issuedCapabilityId = decision.capability.id;
                     } else {
                       observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Capability denied by authority: ${decision.decision === 'DENIED' ? decision.reason : 'requires owner approval'}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, decision: decision.decision } });
                     }

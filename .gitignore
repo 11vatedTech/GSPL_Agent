@@ -6,5 +6,7 @@ coverage/
 .env
 .env.local
 .gspl-agent-state/
+.gspl-test-state/
+.gspl-*-state/
 *.log
 tmp/

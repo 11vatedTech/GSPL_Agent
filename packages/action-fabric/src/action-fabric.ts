@@ -273,51 +273,59 @@ export function createActionExecutor(
 
   return {
     async execute(actionId, params, authorization, capabilityManager) {
+      // §3: Fail closed — reject missing authorization at runtime
+      if (!authorization) {
+        return failResult(actionId, [{ code: 'AUTHORIZATION_CONTEXT_MISSING', message: 'Every external effect requires a complete authorization context', severity: 'fatal', recoverable: false }]);
+      }
+
       const action = registry.get(actionId);
       if (!action) {
         return failResult(actionId, [{ code: 'ACTION_NOT_FOUND', message: 'Action not registered', severity: 'fatal', recoverable: false }]);
       }
 
-      // §6: If authorization context is provided, verify it independently
-      if (authorization) {
-        // Verify action ID matches
-        if (authorization.actionId !== actionId) {
-          return failResult(actionId, [{ code: 'ACTION_ID_MISMATCH', message: `Authorization context actionId ${authorization.actionId} does not match invoked action ${actionId}`, severity: 'fatal', recoverable: false }]);
-        }
-        // Verify effect type matches
-        if (authorization.effectType !== action.effectType) {
-          return failResult(actionId, [{ code: 'EFFECT_TYPE_MISMATCH', message: `Authorization context effectType ${authorization.effectType} does not match action effectType ${action.effectType}`, severity: 'fatal', recoverable: false }]);
-        }
+      // §4: Require nonempty capability ID
+      if (!authorization.capabilityId) {
+        return failResult(actionId, [{ code: 'CAPABILITY_ID_MISSING', message: 'Authorization context requires a nonempty capability ID', severity: 'fatal', recoverable: false }]);
+      }
 
-        // §6 step 5: Independently recompute canonical parameter hash from actual params
-        const scope: CapabilityScope = {
-          toolName: actionId,
-          path: authorization.canonicalTarget ?? undefined,
-        };
-        const recomputedHash = canonicalHash(
-          action.effectType,
-          authorization.principalId,
-          authorization.sessionId,
-          scope,
-          authorization.intentId,
-          authorization.planId,
-          authorization.planNodeId,
-          params,
-        );
-        if (recomputedHash !== authorization.canonicalParameterHash) {
-          return failResult(actionId, [{ code: 'PARAMETER_HASH_MISMATCH', message: `Canonical parameter hash mismatch: authorization ${authorization.canonicalParameterHash.slice(0, 16)}... vs computed ${recomputedHash.slice(0, 16)}...`, severity: 'fatal', recoverable: false }]);
-        }
+      // §6: Verify authorization context independently
+      // Verify action ID matches
+      if (authorization.actionId !== actionId) {
+        return failResult(actionId, [{ code: 'ACTION_ID_MISMATCH', message: `Authorization context actionId ${authorization.actionId} does not match invoked action ${actionId}`, severity: 'fatal', recoverable: false }]);
+      }
+      // Verify effect type matches
+      if (authorization.effectType !== action.effectType) {
+        return failResult(actionId, [{ code: 'EFFECT_TYPE_MISMATCH', message: `Authorization context effectType ${authorization.effectType} does not match action effectType ${action.effectType}`, severity: 'fatal', recoverable: false }]);
+      }
 
-        const auth = capabilityManager.check(
-          action.effectType,
-          scope,
-          authorization.principalId,
-          authorization.sessionId,
-          recomputedHash,
-        );
-        if (!auth.authorized) {
-          return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
-        }
+      // §6 step 5: Independently recompute canonical parameter hash from actual params
+      const scope: CapabilityScope = {
+        toolName: actionId,
+        path: authorization.canonicalTarget ?? undefined,
+      };
+      const recomputedHash = canonicalHash(
+        action.effectType,
+        authorization.principalId,
+        authorization.sessionId,
+        scope,
+        authorization.intentId,
+        authorization.planId,
+        authorization.planNodeId,
+        params,
+      );
+      if (recomputedHash !== authorization.canonicalParameterHash) {
+        return failResult(actionId, [{ code: 'PARAMETER_HASH_MISMATCH', message: `Canonical parameter hash mismatch: authorization ${authorization.canonicalParameterHash.slice(0, 16)}... vs computed ${recomputedHash.slice(0, 16)}...`, severity: 'fatal', recoverable: false }]);
+      }
+
+      const auth = capabilityManager.check(
+        action.effectType,
+        scope,
+        authorization.principalId,
+        authorization.sessionId,
+        recomputedHash,
+      );
+      if (!auth.authorized) {
+        return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
       }
 
       return executeActionHandler(action, params, fsAdapter);
@@ -580,7 +588,7 @@ export function createTestAuthorizationContext(overrides?: Partial<ActionAuthori
     authorizationVersion: 1,
     principalId: 'test-principal', sessionId: 'test-session',
     intentId: 'test-intent', planId: 'test-plan', planNodeId: 'test-node',
-    capabilityId: '', actionId: 'fs-read', effectType: 'FILESYSTEM_READ',
+    capabilityId: 'test-cap-0', actionId: 'fs-read', effectType: 'FILESYSTEM_READ',
     canonicalTarget: null, canonicalParameterHash: '', approvalEvidenceId: null,
     ...overrides,
   };
