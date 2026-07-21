@@ -321,12 +321,13 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       const goal = intent.goal.toLowerCase();
       const workspace = session.workspaceRoot;
 
-      // Determine if this is a file-create intent — use typed artifact operations from intent compiler
+      // Determine if this is a file-create intent — use typed artifact operations (§7)
       const artifactOps = session.compiledIntent?.artifactOperations ?? [];
-      const isFileIntent = goal.includes('create') && (goal.includes('file') || goal.includes('write'));
       const fileOp = artifactOps.find(o => o.artifactType === 'file' && (o.operation === 'create' || o.operation === 'modify'));
-      if (isFileIntent || fileOp) {
-        // Prefer artifact operations from intent compiler, fall back to NL extraction
+      const isFileIntent = goal.includes('create') && (goal.includes('file') || goal.includes('write'));
+      
+      if (fileOp || (isFileIntent && artifactOps.length === 0)) {
+        // Authoritative artifact operations take priority; NL extraction only when artifactOps is empty
         const filename = fileOp?.requestedPath
           ?? session.compiledIntent?.originalStatement?.match(/(?:named\s+)?["']?([^\s"']{1,100})["']?/i)?.[1]
           ?? 'output.txt';
@@ -410,13 +411,14 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       const plan = planExecutor.createPlan(intent.goal, nodes, []);
       plan.status = 'READY';
 
-      // Store plan on session (coordinator has already validated it)
+      // §8: Set plan on session AND return in result (dual path for backward compat)
       session.executionPlan = plan;
 
       return {
         output: {
           planGenerated: true,
           planId: plan.id,
+          plan: plan,
           nodeCount: plan.nodes.length,
           nodes: plan.nodes.map(n => ({ id: n.id, objective: n.objective, status: n.status, actionId: n.actionId })),
         },
@@ -693,10 +695,18 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
         }
       }
 
-      // Check rollback readiness
+      // Check rollback readiness using actual action artifacts (§16)
       if (plan?.nodes.some(n => n.rollback)) {
         const rbResult = await verification.runValidator('rollback-ready', {
-          actual: plan.nodes.filter(n => n.rollback).map(n => ({ beforeState: n.status === 'COMPLETED' ? { existed: true } : undefined })),
+          actual: plan.nodes.filter(n => n.rollback).map(n => {
+            const hasActionArtifacts = n.status === 'COMPLETED' && n.actionId;
+            return {
+              beforeState: hasActionArtifacts ? { existed: true, hasActionId: true, nodeId: n.id } : undefined,
+              nodeId: n.id,
+              actionId: n.actionId,
+              status: n.status,
+            };
+          }),
         });
         results.push(rbResult);
       }
@@ -1022,6 +1032,11 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
             organ.status = result.errors.some(e => e.severity === 'fatal') ? 'FAILED' : 'COMPLETED';
             organ.completedAt = clock();
             if (result.errors.length > 0) executeErrors.push(...result.errors);
+            // §8: Coordinator applies the plan from organ result (non-mutating planner)
+            if ((result.output as any)?.plan) {
+              currentSession.executionPlan = (result.output as any).plan;
+              currentSession = { ...currentSession, executionPlan: (result.output as any).plan };
+            }
           } catch (e) {
             organ.status = 'FAILED';
             executeErrors.push({ code: 'ORGAN_EXECUTION_FAILED', message: e instanceof Error ? e.message : 'unknown', severity: 'error', recoverable: true });
@@ -1283,10 +1298,15 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       }
     }
 
-    // 4. Rollback readiness (if applicable)
+    // 4. Rollback readiness using actual action artifacts (§16)
     if (plan?.nodes.some(n => n.status === 'COMPLETED' && n.rollback)) {
       const rbResult = await verification.runValidator('rollback-ready', {
-        actual: plan.nodes.filter(n => n.rollback).map(n => ({ beforeState: n.status === 'COMPLETED' ? { existed: true } : undefined })),
+        actual: plan.nodes.filter(n => n.rollback && n.status === 'COMPLETED').map(n => ({
+          beforeState: { existed: true, hasActionId: true, nodeId: n.id },
+          nodeId: n.id,
+          actionId: n.actionId,
+          status: n.status,
+        })),
       });
       allResults.push(rbResult);
       if (rbResult.passed) {
@@ -1326,12 +1346,22 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
     const cpId = 'cp-' + session.sessionId + '-tick-' + session.tick;
     const epistemicState = session.epistemicEngine.exportState();
     const capabilityState = session.capabilityManager.exportState();
-    const stateHash = sha256(JSON.stringify({
+    // §12: Complete state hash covering genome, intent, world, memory, epistemics, capabilities, plan, events
+    const fullState = {
       sessionId: session.sessionId,
       tick: session.tick,
-      planId: session.executionPlan?.id,
       phase: session.phase,
-    }));
+      genome: session.genome,
+      intent: session.compiledIntent,
+      worldSize: session.world?.entities?.size ?? 0,
+      memoryNodeCount: session.memoryStore.toMemoryValue().nodes.length,
+      epistemicClaims: epistemicState.claims?.length ?? 0,
+      capabilityCount: capabilityState.length,
+      planId: session.executionPlan?.id,
+      planNodeCount: session.executionPlan?.nodes.length ?? 0,
+      eventCount: eventStore.exportState().length,
+    };
+    const stateHash = sha256(JSON.stringify(fullState));
     const state: PersistedState = {
       schemaVersion: config.schemaVersion,
       agentId: session.sessionId,
