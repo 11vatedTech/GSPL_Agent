@@ -43,6 +43,12 @@ export interface PlanNode {
   rollback: string | null;
   requiresApproval: boolean;
   status: 'PENDING' | 'READY' | 'EXECUTING' | 'COMPLETED' | 'FAILED' | 'CANCELLED' | 'ROLLED_BACK';
+  /** Action ID from the action fabric registry (e.g. 'fs-write', 'fs-read') */
+  actionId?: string;
+  /** Parameters to pass to the action executor */
+  actionParams?: Record<string, unknown>;
+  /** Expected SHA-256 hash of the output artifact */
+  expectedHash?: string;
 }
 
 export interface PlanCapability {

@@ -78,7 +78,11 @@ export type OrganType =
   | 'TESTING'
   | 'ARCHITECTURE_ANALYSIS'
   | 'CREATIVE_SYNTHESIS'
-  | 'INTENT_INTERPRETATION';
+  | 'INTENT_INTERPRETATION'
+  | 'OBSERVATION'
+  | 'EPISTEMIC_UPDATE'
+  | 'FILESYSTEM_EXECUTION'
+  | 'VERIFICATION';
 
 export interface OrganContract {
   organType: OrganType;

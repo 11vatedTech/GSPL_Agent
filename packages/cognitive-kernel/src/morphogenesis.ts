@@ -159,7 +159,7 @@ export function selectCognitiveOrgans(
         shouldSelect = problem.requiresCode;
         break;
       case 'PLANNING':
-        shouldSelect = problem.complexity !== 'simple';
+        shouldSelect = true; // Always needed for any actionable intent
         break;
       case 'RETRIEVAL':
         shouldSelect = problem.requiresResearch;

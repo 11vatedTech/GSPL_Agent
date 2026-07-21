@@ -108,7 +108,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
   it('Step 17: Completion verification checks requirements', async () => {
     const s = coordinator.createSession(createPrimordialGenome());
     const ticked = await coordinator.executeTick(coordinator.submitObjective(s, 'Count files'));
-    const v = coordinator.verifyCompletion(ticked);
+    const v = await coordinator.verifyCompletion(ticked);
     expect(v.complete).toBeDefined();
     expect(v.confidence).toBeGreaterThanOrEqual(0);
   });
@@ -132,7 +132,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
     const s = coordinator.createSession(createPrimordialGenome());
     const intented = coordinator.submitObjective(s, 'Analyze for leaks');
     const executed = await coordinator.executeTick(intented);
-    const v = coordinator.verifyCompletion(executed);
+    const v = await coordinator.verifyCompletion(executed);
     const cp = await coordinator.checkpoint(executed);
     const restored = await coordinator.restoreSession(cp.sessionId);
     expect(intented.compiledIntent!.originalStatement).toBe('Analyze for leaks');

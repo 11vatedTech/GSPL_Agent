@@ -33,17 +33,23 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit -p tsconfig.json
 
-      - name: Run unit tests
-        run: npx vitest run
+      - name: Run unit & integration tests
+        run: npx vitest run --exclude 'tests/e2e/**' --exclude 'tests/security/**'
 
-      - name: Run E2E tests
-        run: npx vitest run tests/e2e-scenarios.test.ts --config vitest.config.ts
+      - name: Run E2E success scenario
+        run: npx vitest run tests/e2e/first-cognitive-execution.test.ts
+
+      - name: Run E2E failure/rollback scenario
+        run: npx vitest run tests/e2e/failure-rollback.test.ts
+
+      - name: Run security E2E tests
+        run: npx vitest run tests/security/coordinator-security.test.ts
 
       - name: Check package boundaries
-        run: |
-          # Verify no AI package depends on more than 2 canon packages
-          echo "Package boundary check: $(ls packages/ | wc -l) AI packages"
-          echo "Canon deps: canon-foundation, gene-protocol (via submodule)"
+        run: node scripts/check-package-boundaries.mjs
+
+      - name: Verify clean working tree
+        run: git diff --exit-code
 
   security:
     runs-on: ubuntu-latest
@@ -64,7 +70,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run security tests
+      - name: Run all security tests
         run: |
+          npx vitest run tests/security/coordinator-security.test.ts
           npx vitest run --dir packages/capability-security
-          npx vitest run tests/e2e-scenarios.test.ts

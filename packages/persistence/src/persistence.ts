@@ -92,6 +92,10 @@ export interface PersistedState {
   createdAt: number;
   updatedAt: number;
   contentHash: string;
+  /** Compiled intent (optional, for session restore) */
+  compiledIntent?: unknown;
+  /** Workspace root for isolated filesystem operations */
+  workspaceRoot?: string;
 }
 
 export interface PersistenceConfig {
