@@ -40,6 +40,10 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
     testClock = 1000000;
     idCounter = 0;
 
+    // ONE shared registry — the executor and coordinator MUST use the same one
+    const registry = createActionRegistry();
+    registerStandardActions(registry);
+
     coordinator = createRuntimeCoordinator({
       config: {
         storagePath,
@@ -62,14 +66,10 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
       eventStore: createEventStore(),
       observability: createObservabilitySystem(),
       verification: createVerificationEngine(),
-      actionRegistry: createActionRegistry(),
-      actionExecutor: createActionExecutor(createActionRegistry(), { allowedRoots: [workspace] }),
+      actionRegistry: registry,
+      actionExecutor: createActionExecutor(registry, { allowedRoots: [workspace] }),
       transactionManager: createTransactionManager(),
     });
-
-    // Action executor needs the registry
-    const registry = createActionRegistry();
-    registerStandardActions(registry);
   });
 
   afterAll(async () => {

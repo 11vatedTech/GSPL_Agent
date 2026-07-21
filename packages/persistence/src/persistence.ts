@@ -96,6 +96,8 @@ export interface PersistedState {
   compiledIntent?: unknown;
   /** Workspace root for isolated filesystem operations */
   workspaceRoot?: string;
+  /** Session tick counter */
+  tick?: number;
 }
 
 export interface PersistenceConfig {

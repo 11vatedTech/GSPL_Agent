@@ -122,7 +122,19 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       }
     },
     check(effectType, scope) {
-      // Evaluate against policy rules
+      // FIRST: Check for a matching capability in the granted capabilities Map
+      // Possession of a valid (unrevoked, unexpired) capability overrides policy defaults
+      for (const cap of capabilities.values()) {
+        if (cap.revokedAt) continue;
+        if (cap.expiresAt && cap.expiresAt < Date.now()) continue;
+        if (cap.effectType !== effectType) continue;
+        // Scope matching: at minimum, toolName must match if both have it
+        if (scope.toolName && cap.scope.toolName && scope.toolName !== cap.scope.toolName) continue;
+        if (scope.path && cap.scope.path && !scope.path.startsWith(cap.scope.path)) continue;
+        return { authorized: true, reason: `Granted capability: ${cap.name}`, requiredApproval: false, matchedRule: undefined };
+      }
+
+      // SECOND: Evaluate against policy rules
       const sortedRules = [...policy.rules].sort((a, b) => b.priority - a.priority);
 
       for (const rule of sortedRules) {
@@ -139,10 +151,10 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         }
       }
 
-      // Default effect
+      // Default effect (only reaches here if no capability granted AND no rule matched)
       return {
         authorized: policy.defaultEffect === 'ALLOW',
-        reason: `Default policy: ${policy.defaultEffect}`,
+        reason: policy.defaultEffect === 'DENY' ? 'No matching capability granted and default policy is DENY' : `Default policy: ${policy.defaultEffect}`,
         requiredApproval: policy.defaultEffect === 'REQUIRE_APPROVAL',
         matchedRule: undefined,
       };
