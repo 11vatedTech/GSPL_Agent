@@ -157,7 +157,7 @@ export interface ActionAuthorizationContext {
 // ── Action Executor ──
 
 export interface ActionExecutor {
-  execute(actionId: string, params: unknown, capabilityManager: CapabilityManager, authorization?: ActionAuthorizationContext): Promise<ActionResult>;
+  execute(actionId: string, params: unknown, authorization: ActionAuthorizationContext, capabilityManager: CapabilityManager): Promise<ActionResult>;
   dryRun(actionId: string, params: unknown): ActionResult;
   rollback(result: ActionResult): Promise<RollbackResult>;
 }
@@ -272,7 +272,7 @@ export function createActionExecutor(
   };
 
   return {
-    async execute(actionId, params, capabilityManager, authorization) {
+    async execute(actionId, params, authorization, capabilityManager) {
       const action = registry.get(actionId);
       if (!action) {
         return failResult(actionId, [{ code: 'ACTION_NOT_FOUND', message: 'Action not registered', severity: 'fatal', recoverable: false }]);
@@ -315,13 +315,6 @@ export function createActionExecutor(
           authorization.sessionId,
           recomputedHash,
         );
-        if (!auth.authorized) {
-          return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
-        }
-      } else {
-        // Legacy path: backward-compatible check without full authorization context
-        const scope: CapabilityScope = { toolName: actionId };
-        const auth = capabilityManager.check(action.effectType, scope);
         if (!auth.authorized) {
           return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
         }
@@ -580,6 +573,18 @@ function artId(): string {
 }
 
 // ── Register Standard Actions ──
+
+/** §1 helper: Constructs a minimal authorization context for test purposes. */
+export function createTestAuthorizationContext(overrides?: Partial<ActionAuthorizationContext>): ActionAuthorizationContext {
+  return {
+    authorizationVersion: 1,
+    principalId: 'test-principal', sessionId: 'test-session',
+    intentId: 'test-intent', planId: 'test-plan', planNodeId: 'test-node',
+    capabilityId: '', actionId: 'fs-read', effectType: 'FILESYSTEM_READ',
+    canonicalTarget: null, canonicalParameterHash: '', approvalEvidenceId: null,
+    ...overrides,
+  };
+}
 
 export function registerStandardActions(registry: ActionRegistry): void {
   const standard: ActionDescriptor[] = [

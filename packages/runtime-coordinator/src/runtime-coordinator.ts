@@ -27,10 +27,11 @@ import type {
 import { createPrimordialGenome, validateSovereignGenome, createChildGenome, performMorphogenesis } from '@gspl/cognitive-kernel';
 import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
+import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
-import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor } from '@gspl/action-fabric';
+import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
 import { createPersistenceLayer, type PersistenceLayer, type PersistedState } from '@gspl/persistence';
 import { createEventStore, type EventStore } from '@gspl/event-history';
@@ -151,9 +152,45 @@ export interface CompletionVerification {
   confidence: number;
 }
 
+// §12: Explicit test policy with standard filesystem ALLOW rules at high priority
+export const DEFAULT_TEST_POLICY: PolicyValue = {
+  rules: [
+    { id: 'test-fs-read', description: 'Test: allow filesystem read', condition: { action: 'filesystem-read' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] },
+    { id: 'test-fs-write', description: 'Test: allow filesystem write', condition: { action: 'filesystem-write' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] },
+  ],
+  defaultEffect: 'DENY', version: 1, constitutionalInvariants: ['no-ambient-authority'],
+};
+
+/** Create a test genome with explicit ALLOW policy rules for filesystem operations. */
+export function createTestGenome() {
+  const g = createPrimordialGenome();
+  return { ...g, genes: { ...g.genes, actionBounds: DEFAULT_TEST_POLICY } };
+}
+
+// §2: Convenience constructor for tests — injects test authority provider and default infra
+export function createTestRuntimeCoordinator(overrides?: Partial<RuntimeDependencies> & { config?: Partial<RuntimeConfig> }): RuntimeCoordinator {
+  const baseGenerateId = (p?: string) => (p ?? 'gid') + '-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+  const baseRegistry = createActionRegistry();
+  registerStandardActions(baseRegistry);
+  return createRuntimeCoordinator({
+    authorityProvider: createTestAuthorityProvider(baseGenerateId),
+    persistence: createPersistenceLayer({ storagePath: './.gspl-test-state', schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, compressionEnabled: false }),
+    eventStore: createEventStore(),
+    observability: createObservabilitySystem(),
+    verification: createVerificationEngine(),
+    actionRegistry: baseRegistry,
+    actionExecutor: createActionExecutor(baseRegistry),
+    transactionManager: createTransactionManager(),
+    clock: () => Date.now(),
+    generateId: baseGenerateId,
+    config: { ...DEFAULT_RUNTIME_CONFIG, ...overrides?.config },
+    ...overrides,
+  });
+}
+
 // ── Implementation ──
 
-export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { config?: Partial<RuntimeConfig> }): RuntimeCoordinator {
+export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: Partial<RuntimeConfig> }): RuntimeCoordinator {
   const config: RuntimeConfig = {
     ...DEFAULT_RUNTIME_CONFIG,
     ...deps.config,
@@ -177,11 +214,14 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
   const clock: () => number = deps.clock ?? (() => Date.now());
   const generateId: (prefix?: string) => string = deps.generateId ??
     ((p) => (p ?? 'gid') + '-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
-  // §1: Authority provider — required trust boundary, default to test provider if not injected
-  const authorityProvider: AuthorityProvider = (deps as any).authorityProvider ?? createTestAuthorityProvider(generateId);
+  // §1: Authority provider — required trust boundary
+  const authorityProvider: AuthorityProvider = deps.authorityProvider;
   const planExecutor = createPlanExecutor();
 
   registerStandardActions(actionRegistry);
+
+  // §12: Explicit test policy — exported for tests to use
+  // Runtime must never silently inject policy rules during session creation.
 
   // ── SHA-256 helper ──
   function sha256(data: string): string {
@@ -545,7 +585,24 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
         const params = node.actionParams ?? {};
         const tx = transactionManager.beginTransaction(node.objective);
 
-        const result = await actionExecutor.execute(actionId, params, session.capabilityManager);
+        // §1: Construct mandatory authorization context — no action executes without it
+        const actionDesc = actionRegistry.get(actionId);
+        const effectType = actionDesc?.effectType ?? ('FILESYSTEM_WRITE' as EffectType);
+        const authCtx: ActionAuthorizationContext = {
+          authorizationVersion: 1,
+          principalId: session.sessionId,
+          sessionId: session.sessionId,
+          intentId: session.compiledIntent?.intent.goal ?? '',
+          planId: session.executionPlan?.id ?? '',
+          planNodeId: node.id,
+          capabilityId: '',
+          actionId,
+          effectType,
+          canonicalTarget: (params as any)?.path ?? null,
+          canonicalParameterHash: canonicalHash(effectType, session.sessionId, session.sessionId, { toolName: actionId, path: (params as any)?.path }, session.compiledIntent?.intent.goal, session.executionPlan?.id, node.id, params),
+          approvalEvidenceId: null,
+        };
+        const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
 
         // Update plan node status
         node.status = result.success ? 'COMPLETED' : 'FAILED';
@@ -967,9 +1024,7 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       throw new Error('Invalid agent genome: ' + validation.errors.join('; '));
     }
 
-    // §4: Ensure standard policy rules exist — the default genome has empty rules
-    const policy = ensureStandardPolicyRules(g.genes.actionBounds);
-
+    // §12: Use genome's policy directly — no automatic expansion
     return {
       sessionId: generateId('session'),
       genome: g,
@@ -978,7 +1033,7 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       cognitiveGraph: null,
       epistemicEngine: createEpistemicEngine(),
       memoryStore: createMemoryStore(),
-      capabilityManager: createCapabilityManager(policy),
+      capabilityManager: createCapabilityManager(g.genes.actionBounds),
       availableOrgans: buildDefaultOrganContracts(),
       tick: g.$lineage.tick,
       phase: 'INTAKE',
@@ -1020,8 +1075,7 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
     }
 
     // Restore capability manager — use importState to preserve exact IDs, expiration, revocation
-    const policy = ensureStandardPolicyRules(genome.genes.actionBounds);
-    const capabilityManager = createCapabilityManager(policy);
+    const capabilityManager = createCapabilityManager(genome.genes.actionBounds);
     if (Array.isArray(state.capabilities) && state.capabilities.length > 0) {
       capabilityManager.importState(state.capabilities as any);
     }

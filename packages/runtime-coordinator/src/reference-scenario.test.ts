@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, afterAll, beforeEach } from 'vitest';
-import { createRuntimeCoordinator, type AgentSession, type RuntimeCoordinator } from './runtime-coordinator.js';
+import { createTestRuntimeCoordinator, DEFAULT_TEST_POLICY, type AgentSession, type RuntimeCoordinator } from './runtime-coordinator.js';
 import { createPrimordialGenome } from '@gspl/cognitive-kernel';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 const TEST_DIR = mkdtempSync(join(tmpdir(), 'gspl-ref-scenario-'));
 
 function makeCoordinator(): RuntimeCoordinator {
-  return createRuntimeCoordinator({
+  return createTestRuntimeCoordinator({
     config: {
       storagePath: TEST_DIR,
       schemaVersion: 1,

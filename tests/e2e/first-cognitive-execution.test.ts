@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { createRuntimeCoordinator, type RuntimeCoordinator, type AgentSession } from '../../packages/runtime-coordinator/src/runtime-coordinator';
+import { createTestRuntimeCoordinator, createTestGenome, type RuntimeCoordinator, type AgentSession } from '../../packages/runtime-coordinator/src/runtime-coordinator';
 import { createPrimordialGenome } from '@gspl/cognitive-kernel';
 import { createPersistenceLayer } from '@gspl/persistence';
 import { createEventStore } from '@gspl/event-history';
@@ -44,7 +44,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
     const registry = createActionRegistry();
     registerStandardActions(registry);
 
-    coordinator = createRuntimeCoordinator({
+    coordinator = createTestRuntimeCoordinator({
       config: {
         storagePath,
         schemaVersion: 2,
@@ -82,14 +82,14 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   }
 
   it('1. creates an agent session', () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     expect(session.sessionId).toBeDefined();
     expect(session.workspaceRoot).toBe(workspace);
     expect(session.phase).toBe('INTAKE');
   });
 
   it('2. submits an owner objective to create a file', () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt with the message "GSPL cognitive execution verified"',
@@ -100,7 +100,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('3. executes a cognitive tick — generates phenotype, plan, executes real action', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt containing "GSPL cognitive execution verified"',
@@ -123,7 +123,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('4. independently observes the created artifact', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt containing "GSPL cognitive execution verified"',
@@ -151,7 +151,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('5. verifies completion with real validators', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt containing "GSPL cognitive execution verified"',
@@ -170,7 +170,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('6. persists complete session state and restores semantic equality', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt containing "GSPL cognitive execution verified"',
@@ -196,7 +196,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('7. replays durable events after restart', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named test-output.txt containing "GSPL cognitive execution verified"',
@@ -213,11 +213,11 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('8. produces structurally different phenotypes for different objectives', async () => {
-    const session1 = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session1 = coordinator.createSession(createTestGenome(), workspace);
     const intent1 = coordinator.submitObjective(session1, 'Create a file named test-a.txt');
     const result1 = await coordinator.executeTick(intent1);
 
-    const session2 = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session2 = coordinator.createSession(createTestGenome(), workspace);
     const intent2 = coordinator.submitObjective(session2, 'Analyze the repository structure');
     const result2 = await coordinator.executeTick(intent2);
 
@@ -234,7 +234,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('9. validates cognitive graphs before execution', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(session, 'Create a file named test.txt');
     const executed = await coordinator.executeTick(withIntent);
 
@@ -244,7 +244,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
   });
 
   it('10. completes the full lifecycle: intent → plan → execute → observe → verify → persist', async () => {
-    const session = coordinator.createSession(createPrimordialGenome(), workspace);
+    const session = coordinator.createSession(createTestGenome(), workspace);
     const withIntent = coordinator.submitObjective(
       session,
       'Create a file named final-test.txt containing "Full lifecycle complete"',

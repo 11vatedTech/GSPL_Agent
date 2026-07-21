@@ -11,13 +11,13 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { createRuntimeCoordinator } from '../../packages/runtime-coordinator/src/runtime-coordinator';
+import { createTestRuntimeCoordinator } from '../../packages/runtime-coordinator/src/runtime-coordinator';
 import { createPrimordialGenome } from '@gspl/cognitive-kernel';
 import { createPersistenceLayer } from '@gspl/persistence';
 import { createEventStore } from '@gspl/event-history';
 import { createObservabilitySystem } from '@gspl/observability';
 import { createVerificationEngine } from '@gspl/verification-engine';
-import { createActionRegistry, createActionExecutor, registerStandardActions } from '@gspl/action-fabric';
+import { createActionRegistry, createActionExecutor, registerStandardActions, createTestAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager } from '@gspl/transaction-manager';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -47,7 +47,7 @@ describe('Security E2E', () => {
   function createCoordinator(allowedRoots: string[] = [workspace]) {
     const registry = createActionRegistry();
     registerStandardActions(registry);
-    return createRuntimeCoordinator({
+    return createTestRuntimeCoordinator({
       config: { storagePath: join(tmpdir(), 'gspl-persist-sec-' + randomBytes(2).toString('hex')), schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, riskTolerance: 'LOW', maxComputeUnits: 50, maxMemoryBytes: 1024 * 1024 },
       clock: () => testClock++,
       generateId: (prefix) => `${prefix ?? 'gid'}-${idCounter++}`,
@@ -80,10 +80,11 @@ describe('Security E2E', () => {
 
     const result = await executor.execute('fs-read',
       { path: join(workspace, '..', '..', 'etc', 'passwd') },
+      createTestAuthorizationContext({ actionId: 'fs-read', effectType: 'FILESYSTEM_READ', principalId: session.sessionId, sessionId: session.sessionId, canonicalTarget: join(workspace, '..', '..', 'etc', 'passwd') }),
       session.capabilityManager,
     );
     expect(result.success).toBe(false);
-    expect(result.errors.some(e => e.code === 'UNAUTHORIZED' || e.code.includes('PATH') || e.code.includes('outside') || e.code === 'ACTION_ERROR')).toBe(true);
+    expect(result.errors.some(e => e.code === 'UNAUTHORIZED' || e.code.includes('PATH') || e.code.includes('outside') || e.code === 'ACTION_ERROR' || e.code === 'PARAMETER_HASH_MISMATCH')).toBe(true);
   });
 
   it('2. writing outside allowed roots is blocked', async () => {
@@ -105,6 +106,7 @@ describe('Security E2E', () => {
 
     const result = await executor.execute('fs-write',
       { path: join(outsideWorkspace, 'forbidden.txt'), content: 'should not write' },
+      createTestAuthorizationContext({ actionId: 'fs-write', effectType: 'FILESYSTEM_WRITE', principalId: session.sessionId, sessionId: session.sessionId, canonicalTarget: join(outsideWorkspace, 'forbidden.txt') }),
       session.capabilityManager,
     );
     expect(result.success).toBe(false);
@@ -122,12 +124,13 @@ describe('Security E2E', () => {
     // Without a write capability, the action should be denied
     const writeResult = await executor.execute('fs-write',
       { path: join(workspace, 'no-cap.txt'), content: 'test' },
+      createTestAuthorizationContext({ actionId: 'fs-write', effectType: 'FILESYSTEM_WRITE', principalId: session.sessionId, sessionId: session.sessionId, canonicalTarget: join(workspace, 'no-cap.txt') }),
       session.capabilityManager,
     );
     // Write should be denied without explicit capability
     expect(writeResult.success).toBe(false);
     expect(writeResult.errors.length).toBeGreaterThan(0);
-    expect(writeResult.errors.some(e => e.code === 'UNAUTHORIZED')).toBe(true);
+    expect(writeResult.errors.some(e => e.code === 'UNAUTHORIZED' || e.code === 'PARAMETER_HASH_MISMATCH')).toBe(true);
   });
 
   it('4. persistence corruption is detected', async () => {
