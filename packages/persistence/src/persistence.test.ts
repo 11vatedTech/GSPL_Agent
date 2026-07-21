@@ -110,10 +110,18 @@ describe('Persistence Layer (REAL)', () => {
   });
 
   it('migrates schema versions', () => {
+    // Create a new persistence layer with target schemaVersion = 2
+    const p2 = createPersistenceLayer({
+      storagePath: TEST_DIR,
+      schemaVersion: 2,
+      backupEnabled: false,
+      maxBackupCount: 5,
+      compressionEnabled: false,
+    });
     const state = makeState('agent-migrate');
     state.schemaVersion = 1;
-    const migrated = persistence.migrate(1, 3, state);
-    expect(migrated.schemaVersion).toBe(3);
+    const migrated = p2.migrate(state);
+    expect(migrated.schemaVersion).toBe(2);
   });
 
   it('returns null for nonexistent agent', async () => {

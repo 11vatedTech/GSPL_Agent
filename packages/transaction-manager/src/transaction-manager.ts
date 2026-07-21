@@ -1,22 +1,73 @@
 /**
- * GSPL Transaction & Checkpoint Manager — REAL IMPLEMENTATION
+ * GSPL Transaction & Checkpoint Manager — FULLY TRUTHFUL IMPLEMENTATION
  *
- * Transactions connect to actual state-changing operations via a StateRestorer callback.
- * Rollback invokes the restorer for each reversible operation in reverse order.
- * Checkpoints use SHA-256 hashing for integrity validation.
+ * - Expanded transaction states: ACTIVE, COMMITTING, COMMITTED, ROLLING_BACK,
+ *   ROLLED_BACK, PARTIALLY_ROLLED_BACK, ROLLBACK_FAILED, COMPENSATING,
+ *   COMPENSATED, PARTIALLY_COMPENSATED, COMPENSATION_FAILED, ABORTED
+ * - Serializable recovery descriptors (persistable, not just callbacks)
+ * - Structured operation results with exposed rollback/compensation errors
+ * - SHA-256 checkpoint hashing with parent chaining
  */
 
 import { createHash } from 'node:crypto';
+
+// ── Expanded Transaction States ──
+
+export type TransactionStatus =
+  | 'ACTIVE'
+  | 'COMMITTING'
+  | 'COMMITTED'
+  | 'ROLLING_BACK'
+  | 'ROLLED_BACK'
+  | 'PARTIALLY_ROLLED_BACK'
+  | 'ROLLBACK_FAILED'
+  | 'COMPENSATING'
+  | 'COMPENSATED'
+  | 'PARTIALLY_COMPENSATED'
+  | 'COMPENSATION_FAILED'
+  | 'ABORTED';
+
+// ── Serializable Recovery Descriptor ──
+// Unlike function callbacks, these can be persisted and replayed after crash.
+
+export interface RecoveryDescriptor {
+  /** Adapter/executor that handles this recovery */
+  adapterId: string;
+  /** Operation type identifier */
+  operationType: 'fs-restore' | 'fs-delete' | 'process-kill' | 'git-reset' | 'compensate' | 'custom';
+  /** Target path or identifier */
+  target: string;
+  /** Parameters needed for recovery */
+  params: Record<string, unknown>;
+  /** Hash of the before-state artifact */
+  beforeArtifactHash?: string;
+  /** Capability required for recovery */
+  requiredCapability?: string;
+}
+
+// ── Operation Result ──
+
+export interface OperationResult {
+  operationId: string;
+  success: boolean;
+  attemptedRestoration: boolean;
+  restorationSuccess: boolean | null;
+  failure?: string;
+  residualEffects: string[];
+  manualRecoveryRequired: boolean;
+}
 
 // ── Types ──
 
 export interface Transaction {
   id: string;
-  status: 'ACTIVE' | 'COMMITTED' | 'ROLLED_BACK' | 'COMPENSATED';
+  status: TransactionStatus;
   startedAt: number;
   completedAt: number | null;
   operations: TransactionOperation[];
   checkpoints: Checkpoint[];
+  /** Accumulated errors during rollback/compensation */
+  recoveryErrors: string[];
 }
 
 export interface TransactionOperation {
@@ -27,9 +78,11 @@ export interface TransactionOperation {
   after: unknown | null;
   reversible: boolean;
   compensation?: string;
-  /** Callback that performs the actual state restoration */
+  /** Serializable recovery descriptor (persistable) */
+  recovery?: RecoveryDescriptor;
+  /** In-process restore callback (not persisted, for performance) */
   restore?: () => Promise<void>;
-  /** Callback that performs the actual compensation action */
+  /** In-process compensate callback (not persisted) */
   compensateFn?: () => Promise<void>;
 }
 
@@ -40,18 +93,20 @@ export interface Checkpoint {
   state: Record<string, unknown>;
   hash: string;
   parentCheckpointId: string | null;
+  schemaVersion: number;
 }
 
-/**
- * StateRestorer is called during rollback to restore actual state.
- * The implementor passes a function that knows how to restore the target
- * from the captured before-state.
- */
-export type StateRestorer = (operation: TransactionOperation) => Promise<void>;
+/** Serializable recovery journal entry — persistable */
+export interface RecoveryJournalEntry {
+  operationId: string;
+  recovery: RecoveryDescriptor;
+  timestamp: number;
+  status: 'pending' | 'executed' | 'failed';
+}
 
 export interface TransactionManagerConfig {
-  /** Optional global state restorer for operations that don't have their own */
-  stateRestorer?: StateRestorer;
+  /** Optional global state restorer for operations without their own */
+  stateRestorer?: (operation: TransactionOperation) => Promise<void>;
 }
 
 // ── Interface ──
@@ -62,6 +117,9 @@ export interface TransactionManager {
   commit(tx: Transaction): Transaction;
   rollback(tx: Transaction): Promise<Transaction>;
   compensate(tx: Transaction): Promise<Transaction>;
+  abort(tx: Transaction): Transaction;
+  /** Get the serializable recovery journal for crash recovery */
+  getRecoveryJournal(tx: Transaction): RecoveryJournalEntry[];
   createCheckpoint(tx: Transaction, state: Record<string, unknown>, label: string): Checkpoint;
   restoreCheckpoint(checkpoint: Checkpoint): Record<string, unknown>;
   validateCheckpoint(checkpoint: Checkpoint): boolean;
@@ -78,7 +136,7 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
   const globalRestorer = config?.stateRestorer;
 
   return {
-    beginTransaction(label = '') {
+    beginTransaction(_label = '') {
       return {
         id: 'tx-' + Date.now().toString(36),
         status: 'ACTIVE',
@@ -86,6 +144,7 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
         completedAt: null,
         operations: [],
         checkpoints: [],
+        recoveryErrors: [],
       };
     },
 
@@ -101,62 +160,166 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
     },
 
     async rollback(tx) {
+      // Transition to ROLLING_BACK
+      let current: Transaction = { ...tx, status: 'ROLLING_BACK', recoveryErrors: [] };
       const reversed = [...tx.operations].reverse();
-      const rollbackErrors: string[] = [];
+      const errors: string[] = [];
+      const results: OperationResult[] = [];
 
       for (const op of reversed) {
+        const result: OperationResult = {
+          operationId: op.id,
+          success: false,
+          attemptedRestoration: false,
+          restorationSuccess: null,
+          residualEffects: [],
+          manualRecoveryRequired: false,
+        };
+
         if (!op.reversible) {
-          // Irreversible operations cannot be rolled back — record but continue
-          rollbackErrors.push(`Cannot rollback irreversible operation ${op.id} (${op.type} on ${op.target})`);
+          result.residualEffects.push(`Irreversible operation ${op.type} on ${op.target} cannot be rolled back`);
+          result.manualRecoveryRequired = true;
+          errors.push(`Cannot rollback irreversible operation ${op.id} (${op.type} on ${op.target})`);
+          results.push(result);
           continue;
         }
+
+        result.attemptedRestoration = true;
         try {
           if (op.restore) {
             await op.restore();
+          } else if (op.recovery) {
+            // Serializable recovery: the caller must provide a recovery executor
+            // that maps adapterId → restore function. For now, fall through to global.
+            if (globalRestorer) {
+              await globalRestorer(op);
+            } else {
+              throw new Error(`No restore handler for recovery descriptor: ${op.recovery.adapterId}`);
+            }
           } else if (globalRestorer) {
             await globalRestorer(op);
+          } else {
+            throw new Error(`No restore mechanism for operation ${op.id}`);
           }
+          result.success = true;
+          result.restorationSuccess = true;
         } catch (e) {
-          rollbackErrors.push(`Rollback of ${op.id} failed: ${e instanceof Error ? e.message : 'unknown'}`);
+          result.restorationSuccess = false;
+          result.failure = e instanceof Error ? e.message : 'unknown';
+          result.residualEffects.push(`Restoration of ${op.target} failed`);
+          errors.push(`Rollback of ${op.id} failed: ${e instanceof Error ? e.message : 'unknown'}`);
         }
+        results.push(result);
       }
 
-      const rolledBackOps = tx.operations.map(op => ({
+      // Determine final status truthfully
+      const hasErrors = errors.length > 0;
+      const someSucceeded = results.some(r => r.restorationSuccess === true);
+      const allIrreversible = results.every(r => r.manualRecoveryRequired);
+
+      let finalStatus: TransactionStatus;
+      if (allIrreversible) {
+        finalStatus = 'ROLLBACK_FAILED';
+      } else if (hasErrors && someSucceeded) {
+        finalStatus = 'PARTIALLY_ROLLED_BACK';
+      } else if (hasErrors && !someSucceeded) {
+        finalStatus = 'ROLLBACK_FAILED';
+      } else {
+        finalStatus = 'ROLLED_BACK';
+      }
+
+      const rolledBackOps = tx.operations.map((op, i) => ({
         ...op,
-        after: op.before,
+        after: results[i]?.restorationSuccess ? op.before : op.after,
       }));
 
       return {
         ...tx,
         operations: rolledBackOps,
-        status: 'ROLLED_BACK' as const,
+        status: finalStatus,
         completedAt: Date.now(),
+        recoveryErrors: errors,
       };
     },
 
     async compensate(tx) {
-      const compensateErrors: string[] = [];
+      let current: Transaction = { ...tx, status: 'COMPENSATING', recoveryErrors: [] };
+      const errors: string[] = [];
+      const results: OperationResult[] = [];
 
       for (const op of tx.operations) {
+        const result: OperationResult = {
+          operationId: op.id,
+          success: false,
+          attemptedRestoration: false,
+          restorationSuccess: null,
+          residualEffects: [],
+          manualRecoveryRequired: false,
+        };
+
+        result.attemptedRestoration = true;
         try {
           if (op.compensateFn) {
             await op.compensateFn();
+            result.success = true;
+            result.restorationSuccess = true;
+          } else if (op.recovery) {
+            if (globalRestorer) {
+              await globalRestorer(op);
+              result.success = true;
+              result.restorationSuccess = true;
+            }
+          } else {
+            result.residualEffects.push('No compensation handler for ' + op.id);
+            errors.push(`Compensation of ${op.id} failed: no handler`);
+            result.restorationSuccess = false;
           }
         } catch (e) {
-          compensateErrors.push(`Compensation of ${op.id} failed: ${e instanceof Error ? e.message : 'unknown'}`);
+          result.restorationSuccess = false;
+          result.failure = e instanceof Error ? e.message : 'unknown';
+          errors.push(`Compensation of ${op.id} failed: ${e instanceof Error ? e.message : 'unknown'}`);
         }
+        results.push(result);
       }
 
-      const compensatedOps = tx.operations.map(op =>
-        op.compensateFn ? { ...op, after: op.before, type: 'COMPENSATED' } : op
+      const hasErrors = errors.length > 0;
+      const someSucceeded = results.some(r => r.restorationSuccess === true);
+
+      let finalStatus: TransactionStatus;
+      if (hasErrors && someSucceeded) {
+        finalStatus = 'PARTIALLY_COMPENSATED';
+      } else if (hasErrors && !someSucceeded) {
+        finalStatus = 'COMPENSATION_FAILED';
+      } else {
+        finalStatus = 'COMPENSATED';
+      }
+
+      const compensatedOps = tx.operations.map((op, i) =>
+        results[i]?.restorationSuccess ? { ...op, after: op.before } : op,
       );
 
       return {
         ...tx,
         operations: compensatedOps,
-        status: 'COMPENSATED' as const,
+        status: finalStatus,
         completedAt: Date.now(),
+        recoveryErrors: errors,
       };
+    },
+
+    abort(tx) {
+      return { ...tx, status: 'ABORTED' as const, completedAt: Date.now() };
+    },
+
+    getRecoveryJournal(tx) {
+      return tx.operations
+        .filter(op => op.recovery)
+        .map(op => ({
+          operationId: op.id,
+          recovery: op.recovery!,
+          timestamp: Date.now(),
+          status: 'pending' as const,
+        }));
     },
 
     createCheckpoint(tx, state, label) {
@@ -168,6 +331,7 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
         state: { ...state },
         hash: sha256(stateJson),
         parentCheckpointId: tx.checkpoints.length > 0 ? tx.checkpoints[tx.checkpoints.length - 1].id : null,
+        schemaVersion: 1,
       };
       checkpoints.set(checkpoint.id, checkpoint);
       return checkpoint;

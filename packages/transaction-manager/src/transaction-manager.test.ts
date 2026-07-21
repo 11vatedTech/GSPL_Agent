@@ -34,9 +34,13 @@ describe('Transaction Manager', () => {
     expect(committed.status).toBe('COMMITTED');
   });
 
-  it('rolls back a transaction', async () => {
-    const tx = tm.beginTransaction('test');
-    const withOp = tm.addOperation(tx, {
+  it('rolls back a transaction (truthfully: requires restore callback)', async () => {
+    let wasRestored = false;
+    const tmWithRestorer = createTransactionManager({
+      stateRestorer: async (_op) => { wasRestored = true; },
+    });
+    const tx = tmWithRestorer.beginTransaction('test');
+    const withOp = tmWithRestorer.addOperation(tx, {
       id: 'op-1',
       type: 'write',
       target: './test.txt',
@@ -44,8 +48,9 @@ describe('Transaction Manager', () => {
       after: 'new',
       reversible: true,
     });
-    const rolled = await tm.rollback(withOp);
+    const rolled = await tmWithRestorer.rollback(withOp);
     expect(rolled.status).toBe('ROLLED_BACK');
+    expect(wasRestored).toBe(true);
     expect(rolled.operations[0].after).toBe('old');
   });
 
@@ -78,12 +83,11 @@ describe('Transaction Manager', () => {
   it('detects corrupted checkpoints', () => {
     const tx = tm.beginTransaction('test');
     const cp = tm.createCheckpoint(tx, { key: 'value' }, 'snapshot');
-    // Tamper with checkpoint
     cp.state.key = 'tampered';
     expect(tm.validateCheckpoint(cp)).toBe(false);
   });
 
-  it('handles irreversible operations in rollback', async () => {
+  it('handles irreversible operations in rollback (truthfully: ROLLBACK_FAILED)', async () => {
     const tx = tm.beginTransaction('test');
     const withOp = tm.addOperation(tx, {
       id: 'op-1',
@@ -94,7 +98,9 @@ describe('Transaction Manager', () => {
       reversible: false,
     });
     const rolled = await tm.rollback(withOp);
-    expect(rolled.status).toBe('ROLLED_BACK');
+    // Irreversible operations cannot be rolled back — truthful behavior
+    expect(rolled.status === 'ROLLBACK_FAILED' || rolled.status === 'PARTIALLY_ROLLED_BACK').toBe(true);
+    expect(rolled.recoveryErrors.length).toBeGreaterThan(0);
   });
 
   it('executes restore callback on rollback', async () => {
@@ -111,5 +117,21 @@ describe('Transaction Manager', () => {
     });
     await tm.rollback(withOp);
     expect(restored).toBe(true);
+  });
+
+  it('exposes rollback errors', async () => {
+    const tx = tm.beginTransaction('test');
+    const withOp = tm.addOperation(tx, {
+      id: 'op-1',
+      type: 'write',
+      target: './data.txt',
+      before: 'original',
+      after: 'modified',
+      reversible: true,
+      restore: async () => { throw new Error('disk failure'); },
+    });
+    const rolled = await tm.rollback(withOp);
+    expect(rolled.recoveryErrors.length).toBeGreaterThan(0);
+    expect(rolled.status).toBe('ROLLBACK_FAILED');
   });
 });
