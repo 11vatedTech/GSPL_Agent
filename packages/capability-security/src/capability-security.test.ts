@@ -5,6 +5,7 @@ import type { PolicyValue, PolicyRule } from '@gspl/agent-genes';
 const DEFAULT_POLICY: PolicyValue = {
   rules: [
     { id: 'r1', description: 'Read files', condition: { action: 'filesystem-read' }, effect: 'ALLOW', priority: 10, scope: ['filesystem'] },
+    { id: 'r1b', description: 'Write files', condition: { action: 'filesystem-write' }, effect: 'ALLOW', priority: 10, scope: ['filesystem'] },
     { id: 'r2', description: 'No network', condition: { action: 'network' }, effect: 'DENY', priority: 100, scope: ['network'] },
     { id: 'r3', description: 'Allow inference', condition: { action: 'model-inference' }, effect: 'ALLOW', priority: 5, scope: ['model'] },
   ],

@@ -11,7 +11,7 @@
  * Every effect requires explicit capability authorization.
  */
 
-import type { EffectType, CapabilityScope, CapabilityManager } from '@gspl/capability-security';
+import type { EffectType, CapabilityScope, CapabilityManager, AuthorizationResult } from '@gspl/capability-security';
 import { readFile, writeFile, mkdir, unlink, stat, lstat, realpath } from 'node:fs/promises';
 import { resolve, normalize, relative, dirname, join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -135,10 +135,28 @@ export interface FilesystemAdapterConfig {
   allowDelete: boolean;
 }
 
+// ── Action Authorization Context (§5-§6) ──
+
+/** Complete authorization context bound to every action invocation. */
+export interface ActionAuthorizationContext {
+  authorizationVersion: number;
+  principalId: string;
+  sessionId: string;
+  intentId: string;
+  planId: string;
+  planNodeId: string;
+  capabilityId: string;
+  actionId: string;
+  effectType: EffectType;
+  canonicalTarget: string | null;
+  canonicalParameterHash: string;
+  approvalEvidenceId: string | null;
+}
+
 // ── Action Executor ──
 
 export interface ActionExecutor {
-  execute(actionId: string, params: unknown, capabilityManager: CapabilityManager): Promise<ActionResult>;
+  execute(actionId: string, params: unknown, capabilityManager: CapabilityManager, authorization?: ActionAuthorizationContext): Promise<ActionResult>;
   dryRun(actionId: string, params: unknown): ActionResult;
   rollback(result: ActionResult): Promise<RollbackResult>;
 }
@@ -253,16 +271,47 @@ export function createActionExecutor(
   };
 
   return {
-    async execute(actionId, params, capabilityManager) {
+    async execute(actionId, params, capabilityManager, authorization) {
       const action = registry.get(actionId);
       if (!action) {
         return failResult(actionId, [{ code: 'ACTION_NOT_FOUND', message: 'Action not registered', severity: 'fatal', recoverable: false }]);
       }
-      const scope: CapabilityScope = { toolName: actionId };
-      const auth = capabilityManager.check(action.effectType, scope);
-      if (!auth.authorized) {
-        return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
+
+      // §6: If authorization context is provided, verify it independently
+      if (authorization) {
+        // Verify action ID matches
+        if (authorization.actionId !== actionId) {
+          return failResult(actionId, [{ code: 'ACTION_ID_MISMATCH', message: `Authorization context actionId ${authorization.actionId} does not match invoked action ${actionId}`, severity: 'fatal', recoverable: false }]);
+        }
+        // Verify effect type matches
+        if (authorization.effectType !== action.effectType) {
+          return failResult(actionId, [{ code: 'EFFECT_TYPE_MISMATCH', message: `Authorization context effectType ${authorization.effectType} does not match action effectType ${action.effectType}`, severity: 'fatal', recoverable: false }]);
+        }
+
+        // Build scope from authorization context
+        const scope: CapabilityScope = {
+          toolName: actionId,
+          path: authorization.canonicalTarget ?? undefined,
+        };
+        const auth = capabilityManager.check(
+          action.effectType,
+          scope,
+          authorization.principalId,
+          authorization.sessionId,
+          authorization.canonicalParameterHash,
+        );
+        if (!auth.authorized) {
+          return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
+        }
+      } else {
+        // Legacy path: backward-compatible check without full authorization context
+        const scope: CapabilityScope = { toolName: actionId };
+        const auth = capabilityManager.check(action.effectType, scope);
+        if (!auth.authorized) {
+          return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
+        }
       }
+
       return executeActionHandler(action, params, fsAdapter);
     },
 

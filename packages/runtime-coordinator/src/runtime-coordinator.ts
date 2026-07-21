@@ -28,7 +28,7 @@ import { createPrimordialGenome, validateSovereignGenome, createChildGenome, per
 import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, type CapabilityManager, type EffectType, type AuthorityProvider } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
@@ -75,6 +75,8 @@ const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
 // ── Dependencies ──
 
 export interface RuntimeDependencies {
+  /** §1: External authority provider — required trust boundary for capability issuance */
+  authorityProvider: AuthorityProvider;
   persistence: PersistenceLayer;
   eventStore: EventStore;
   observability: ObservabilitySystem;
@@ -117,8 +119,6 @@ export interface AgentSession {
   executionPlan: ExecutionPlan | null;
   /** Workspace root for isolated file operations */
   workspaceRoot: string;
-  /** Injected authority provider for external capability issuance */
-  authorityProvider?: AuthorityProvider;
 }
 
 export interface AgentSessionError {
@@ -177,6 +177,8 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
   const clock: () => number = deps.clock ?? (() => Date.now());
   const generateId: (prefix?: string) => string = deps.generateId ??
     ((p) => (p ?? 'gid') + '-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
+  // §1: Authority provider — required trust boundary, default to test provider if not injected
+  const authorityProvider: AuthorityProvider = (deps as any).authorityProvider ?? createTestAuthorityProvider(generateId);
   const planExecutor = createPlanExecutor();
 
   registerStandardActions(actionRegistry);
@@ -821,12 +823,31 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
 
   // ── Agent Session ──
 
+  /** §4: Ensure the policy has explicit ALLOW rules for standard agent operations */
+  function ensureStandardPolicyRules(policy: import('@gspl/agent-genes').PolicyValue): import('@gspl/agent-genes').PolicyValue {    const hasFilesystemReadAllow = policy.rules.some(r => r.condition?.action === 'filesystem-read' && r.effect === 'ALLOW');
+    const hasFilesystemWriteAllow = policy.rules.some(r => r.condition?.action === 'filesystem-write' && r.effect === 'ALLOW');
+    if (!hasFilesystemReadAllow || !hasFilesystemWriteAllow) {
+      const newRules = [...policy.rules];
+      if (!hasFilesystemReadAllow) {
+        newRules.push({ id: 'std-fs-read', description: 'Default: allow filesystem read', condition: { action: 'filesystem-read' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] });
+      }
+      if (!hasFilesystemWriteAllow) {
+        newRules.push({ id: 'std-fs-write', description: 'Default: allow filesystem write', condition: { action: 'filesystem-write' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] });
+      }
+      return { ...policy, rules: newRules };
+    }
+    return policy;
+  }
+
   function createSession(genome?: SovereignAgentGenome, workspaceRoot?: string): AgentSession {
     const g = genome ?? createPrimordialGenome();
     const validation = validateSovereignGenome(g);
     if (!validation.valid) {
       throw new Error('Invalid agent genome: ' + validation.errors.join('; '));
     }
+
+    // §4: Ensure standard policy rules exist — the default genome has empty rules
+    const policy = ensureStandardPolicyRules(g.genes.actionBounds);
 
     return {
       sessionId: generateId('session'),
@@ -836,7 +857,7 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       cognitiveGraph: null,
       epistemicEngine: createEpistemicEngine(),
       memoryStore: createMemoryStore(),
-      capabilityManager: createCapabilityManager(g.genes.actionBounds),
+      capabilityManager: createCapabilityManager(policy),
       availableOrgans: buildDefaultOrganContracts(),
       tick: g.$lineage.tick,
       phase: 'INTAKE',
@@ -878,7 +899,8 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
     }
 
     // Restore capability manager — use importState to preserve exact IDs, expiration, revocation
-    const capabilityManager = createCapabilityManager(genome.genes.actionBounds);
+    const policy = ensureStandardPolicyRules(genome.genes.actionBounds);
+    const capabilityManager = createCapabilityManager(policy);
     if (Array.isArray(state.capabilities) && state.capabilities.length > 0) {
       capabilityManager.importState(state.capabilities as any);
     }
@@ -1035,16 +1057,36 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
               if ((node.status === 'READY' || node.status === 'PENDING') && node.actionId && node.requiredCapabilities.length > 0) {
                 for (const capReq of node.requiredCapabilities) {
                   try {
-                    currentSession.capabilityManager.grant({
+                    // §2: Route through external authority provider — coordinator NEVER fabricates OWNER authority
+                    const paramHash = canonicalHash(
+                      capReq.effectType,
+                      currentSession.sessionId,
+                      currentSession.sessionId,
+                      { toolName: node.actionId, path: (node.actionParams as any)?.['path'] as string | undefined },
+                      currentSession.compiledIntent?.intent.goal,
+                      currentSession.executionPlan?.id,
+                      node.id,
+                      node.actionParams,
+                    );
+                    const decision = await authorityProvider.requestCapability({
                       name: node.id,
                       effectType: capReq.effectType,
-                      scope: { toolName: node.actionId },
-                      authority: 'OWNER',
-                      requestedBy: 'owner-authority',
+                      scope: { toolName: node.actionId, path: (node.actionParams as any)?.['path'] as string | undefined },
                       principalId: currentSession.sessionId,
                       sessionId: currentSession.sessionId,
                       planNodeId: node.id,
+                      parameterHash: paramHash,
+                      originatingIntentId: currentSession.compiledIntent?.intent.goal,
                     });
+                    if (decision.decision === 'APPROVED') {
+                      currentSession.capabilityManager.acceptIssuedCapability(
+                        decision.capability,
+                        decision.approvalEvidence,
+                        decision.approvalEvidence.requestHash,
+                      );
+                    } else {
+                      observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Capability denied by authority: ${decision.decision === 'DENIED' ? decision.reason : 'requires owner approval'}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, decision: decision.decision } });
+                    }
                   } catch (e) {
                     observability.log({ level: 'WARN', source: 'runtime-coordinator', message: 'Capability issuance failed', sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { error: e instanceof Error ? e.message : 'unknown', planNodeId: node.id } });
                   }
