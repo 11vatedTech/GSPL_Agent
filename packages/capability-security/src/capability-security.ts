@@ -144,19 +144,65 @@ export interface AuthorizationResult {
 
 // ── Canonical Parameter Hashing (§4) ──
 
+const CANONICAL_VERSION = 1;
+
 /**
- * Deterministic canonical serializer for action parameters.
- * Sorts keys, normalizes paths, preserves array order.
+ * Complete canonical parameter hash (§4).
+ * Deterministic, platform-aware, rejects unsupported types.
+ * Hash changes when: action, principal, session, intent, plan, node, target, or params change.
+ * Hash is stable when: only object insertion order differs.
  */
-export function canonicalHash(actionId: string, effectType: EffectType, principalId: string, sessionId: string, params: unknown): string {
+export function canonicalHash(
+  effectType: EffectType,
+  principalId: string,
+  sessionId: string,
+  scope: CapabilityScope,
+  intentId?: string,
+  planId?: string,
+  planNodeId?: string,
+  params?: unknown,
+): string {
+  // Validate no unsupported types
+  if (params !== undefined) {
+    validateSerializable(params, 'params');
+  }
   const canonical = stableSerialize({
-    actionId,
+    v: CANONICAL_VERSION,
     effectType,
     principalId,
     sessionId,
-    params,
+    scope: normalizeScopeForHashing(scope),
+    intentId: intentId ?? '',
+    planId: planId ?? '',
+    planNodeId: planNodeId ?? '',
+    params: params ?? {},
   });
   return createHash('sha256').update(canonical, 'utf-8').digest('hex');
+}
+
+function normalizeScopeForHashing(scope: CapabilityScope): Record<string, unknown> {
+  const normalized: Record<string, unknown> = {};
+  if (scope.path) normalized.path = scope.path.replace(/\\/g, '/');
+  if (scope.toolName) normalized.toolName = scope.toolName;
+  if (scope.host) normalized.host = scope.host;
+  if (scope.modelId) normalized.modelId = scope.modelId;
+  if (scope.memoryType) normalized.memoryType = scope.memoryType;
+  return normalized;
+}
+
+function validateSerializable(value: unknown, path: string): void {
+  if (value === null || value === undefined) return;
+  if (typeof value === 'function') throw new Error(`Unsupported type at ${path}: function`);
+  if (typeof value === 'symbol') throw new Error(`Unsupported type at ${path}: symbol`);
+  if (typeof value === 'bigint') return; // bigints are serializable via JSON
+  if (typeof value === 'number' && !isFinite(value)) throw new Error(`Unsupported type at ${path}: non-finite number`);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) validateSerializable(value[i], `${path}[${i}]`);
+  } else if (typeof value === 'object') {
+    for (const key of Object.keys(value)) {
+      validateSerializable((value as Record<string, unknown>)[key], `${path}.${key}`);
+    }
+  }
 }
 
 function stableSerialize(obj: unknown): string {
@@ -169,6 +215,79 @@ function stableSerialize(obj: unknown): string {
     }
     return v;
   });
+}
+
+// ── Authority Provider (§2) ──
+
+/** Injected trust boundary — only external authorities may issue capabilities. */
+export interface AuthorityProvider {
+  requestCapability(request: CapabilityIssuanceRequest): Promise<CapabilityIssuanceDecision>;
+}
+
+export interface CapabilityIssuanceRequest {
+  name: string;
+  effectType: EffectType;
+  scope: CapabilityScope;
+  principalId: string;
+  sessionId: string;
+  planNodeId?: string;
+  parameterHash?: string;
+  originatingIntentId?: string;
+  ttlMs?: number;
+}
+
+export interface ApprovalEvidence {
+  id: string;
+  issuer: string;
+  issuedAt: number;
+  requestHash: string;
+  signature?: string;
+}
+
+export type CapabilityIssuanceDecision =
+  | { decision: 'APPROVED'; capability: Capability; approvalEvidence: ApprovalEvidence }
+  | { decision: 'DENIED'; reason: string }
+  | { decision: 'REQUIRES_OWNER_APPROVAL'; requestId: string };
+
+/** Deterministic test authority — approves all requests with OWNER authority. */
+export function createTestAuthorityProvider(generateId: (prefix?: string) => string): AuthorityProvider {
+  return {
+    async requestCapability(req) {
+      const capId = `cap-${Date.now().toString(36)}-${generateId('auth')}`;
+      const capability: Capability = {
+        id: capId, name: req.name, description: '',
+        effectType: req.effectType, scope: req.scope, authority: 'OWNER',
+        delegated: false, delegator: null,
+        createdAt: Date.now(),
+        expiresAt: req.ttlMs ? Date.now() + req.ttlMs : null,
+        revokedAt: null, attenuation: [],
+        principalId: req.principalId, sessionId: req.sessionId,
+        planNodeId: req.planNodeId, parameterHash: req.parameterHash,
+        originatingIntentId: req.originatingIntentId,
+        delegationLineage: [],
+        issuanceEvidence: { issuer: 'test-authority', timestamp: Date.now() },
+      };
+      return {
+        decision: 'APPROVED',
+        capability,
+        approvalEvidence: {
+          id: 'approval-' + generateId('ev'),
+          issuer: 'test-authority',
+          issuedAt: Date.now(),
+          requestHash: canonicalHash(req.effectType, req.principalId, req.sessionId, req.scope),
+        },
+      };
+    },
+  };
+}
+
+/** Deny-all authority — for security testing. */
+export function createDenyAllAuthorityProvider(): AuthorityProvider {
+  return {
+    async requestCapability() {
+      return { decision: 'DENIED', reason: 'All capability requests denied by policy' };
+    },
+  };
 }
 
 // ── Default Result Helpers ──
