@@ -583,7 +583,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       try {
         const actionId = node.actionId ?? 'fs-write';
         const params = node.actionParams ?? {};
-        const tx = transactionManager.beginTransaction(node.objective);
+        let tx = transactionManager.beginTransaction(node.objective);
 
         // §1: Construct mandatory authorization context — no action executes without it
         const actionDesc = actionRegistry.get(actionId);
@@ -611,7 +611,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (result.success) {
           for (const art of result.artifacts) {
             if (art.beforeState) {
-              transactionManager.addOperation(tx, {
+              tx = transactionManager.addOperation(tx, {
                 id: `op-${art.id}`, type: art.created ? 'create' : 'modify',
                 target: art.path, before: art.beforeState,
                 after: { hash: art.hash, sizeBytes: art.sizeBytes },
@@ -622,7 +622,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               });
             }
           }
-          transactionManager.commit(tx);
+          tx = transactionManager.commit(tx);
         }
 
         return {
@@ -1001,21 +1001,6 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     return { valid: errors.length === 0, errors };
   }
 
-  /** §4: Ensure the policy has explicit ALLOW rules for standard agent operations */
-  function ensureStandardPolicyRules(policy: import('@gspl/agent-genes').PolicyValue): import('@gspl/agent-genes').PolicyValue {    const hasFilesystemReadAllow = policy.rules.some(r => r.condition?.action === 'filesystem-read' && r.effect === 'ALLOW');
-    const hasFilesystemWriteAllow = policy.rules.some(r => r.condition?.action === 'filesystem-write' && r.effect === 'ALLOW');
-    if (!hasFilesystemReadAllow || !hasFilesystemWriteAllow) {
-      const newRules = [...policy.rules];
-      if (!hasFilesystemReadAllow) {
-        newRules.push({ id: 'std-fs-read', description: 'Default: allow filesystem read', condition: { action: 'filesystem-read' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] });
-      }
-      if (!hasFilesystemWriteAllow) {
-        newRules.push({ id: 'std-fs-write', description: 'Default: allow filesystem write', condition: { action: 'filesystem-write' }, effect: 'ALLOW', priority: 20, scope: ['filesystem'] });
-      }
-      return { ...policy, rules: newRules };
-    }
-    return policy;
-  }
 
   function createSession(genome?: SovereignAgentGenome, workspaceRoot?: string): AgentSession {
     const g = genome ?? createPrimordialGenome();
