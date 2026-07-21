@@ -115,7 +115,7 @@ describe('Failure & Rollback E2E', () => {
     // Modify via action fabric (which captures before-state)
     const result = await executor.execute('fs-write',
       { path: originalFile, content: 'MODIFIED CONTENT' },
-      createCoordinator().createSession().capabilityManager,
+      createCoordinator().createSession(createPrimordialGenome()).capabilityManager,
     );
     expect(result.success).toBe(true);
     expect(result.artifacts[0].beforeState?.hash).toBe(originalHash);

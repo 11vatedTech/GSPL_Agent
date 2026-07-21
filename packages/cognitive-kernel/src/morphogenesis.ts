@@ -194,6 +194,19 @@ export function selectCognitiveOrgans(
       case 'SYMBOLIC_REASONING':
         shouldSelect = problem.requiresPrecision;
         break;
+      // Runtime execution organs — always selected for actionable intents
+      case 'FILESYSTEM_EXECUTION':
+        shouldSelect = problem.requiresCreativity || problem.requiresCode || problem.domain.includes('creation');
+        break;
+      case 'OBSERVATION':
+        shouldSelect = true; // Always observe to verify execution
+        break;
+      case 'EPISTEMIC_UPDATE':
+        shouldSelect = true; // Always learn from execution
+        break;
+      case 'VERIFICATION':
+        shouldSelect = true; // Always verify completion
+        break;
       default:
         rejected.push({ organ, reason: 'Not selected for this problem type' });
         continue;

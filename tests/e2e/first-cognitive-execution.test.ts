@@ -63,6 +63,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
       observability: createObservabilitySystem(),
       verification: createVerificationEngine(),
       actionRegistry: createActionRegistry(),
+      actionExecutor: createActionExecutor(createActionRegistry(), { allowedRoots: [workspace] }),
       transactionManager: createTransactionManager(),
     });
 
@@ -187,8 +188,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
     expect(restored.tick).toBe(executed.tick);
 
     // Verify memory was restored
-    const memoryNodes = restored.memoryStore.toMemoryValue().nodes.length > 0;
-    expect(memoryNodes.length).toBeGreaterThan(0);
+    expect(restored.memoryStore.toMemoryValue().nodes.length).toBeGreaterThan(0);
 
     // Verify execution plan was restored
     expect(restored.executionPlan).toBeDefined();
@@ -204,6 +204,7 @@ describe('First Complete Cognitive Execution — Success Scenario', () => {
     const executed = await coordinator.executeTick(withIntent);
 
     // Restore and verify events exist
+    await coordinator.checkpoint(executed);
     const restored = await coordinator.restoreSession(executed.sessionId);
 
     // Check that the restored session has meaningful state
