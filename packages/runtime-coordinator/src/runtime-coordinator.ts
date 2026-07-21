@@ -29,7 +29,7 @@ import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
