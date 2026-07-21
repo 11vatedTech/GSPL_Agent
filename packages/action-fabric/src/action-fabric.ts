@@ -12,6 +12,7 @@
  */
 
 import type { EffectType, CapabilityScope, CapabilityManager, AuthorizationResult } from '@gspl/capability-security';
+import { canonicalHash } from '@gspl/capability-security';
 import { readFile, writeFile, mkdir, unlink, stat, lstat, realpath } from 'node:fs/promises';
 import { resolve, normalize, relative, dirname, join, basename } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -288,17 +289,31 @@ export function createActionExecutor(
           return failResult(actionId, [{ code: 'EFFECT_TYPE_MISMATCH', message: `Authorization context effectType ${authorization.effectType} does not match action effectType ${action.effectType}`, severity: 'fatal', recoverable: false }]);
         }
 
-        // Build scope from authorization context
+        // §6 step 5: Independently recompute canonical parameter hash from actual params
         const scope: CapabilityScope = {
           toolName: actionId,
           path: authorization.canonicalTarget ?? undefined,
         };
+        const recomputedHash = canonicalHash(
+          action.effectType,
+          authorization.principalId,
+          authorization.sessionId,
+          scope,
+          authorization.intentId,
+          authorization.planId,
+          authorization.planNodeId,
+          params,
+        );
+        if (recomputedHash !== authorization.canonicalParameterHash) {
+          return failResult(actionId, [{ code: 'PARAMETER_HASH_MISMATCH', message: `Canonical parameter hash mismatch: authorization ${authorization.canonicalParameterHash.slice(0, 16)}... vs computed ${recomputedHash.slice(0, 16)}...`, severity: 'fatal', recoverable: false }]);
+        }
+
         const auth = capabilityManager.check(
           action.effectType,
           scope,
           authorization.principalId,
           authorization.sessionId,
-          authorization.canonicalParameterHash,
+          recomputedHash,
         );
         if (!auth.authorized) {
           return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);

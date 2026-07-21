@@ -327,7 +327,11 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
 
       // §6: Use ONLY typed artifact operations from intent compiler — no NL parsing
       const artifactOps = session.compiledIntent?.artifactOperations ?? [];
-      const fileOp = artifactOps.find(o => o.artifactType === 'file' && (o.operation === 'create' || o.operation === 'modify'));
+      const fileCreateOp = artifactOps.find(o => o.artifactType === 'file' && o.operation === 'create');
+      const fileModifyOp = artifactOps.find(o => o.artifactType === 'file' && o.operation === 'modify');
+      const fileReadOp = artifactOps.find(o => o.artifactType === 'file' && o.operation === 'read');
+      const fileDeleteOp = artifactOps.find(o => o.artifactType === 'file' && o.operation === 'delete');
+      const fileOp = fileCreateOp ?? fileModifyOp;
       
       if (fileOp) {
         // Authoritative artifact operations from intent compiler
@@ -366,6 +370,72 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
           actionId: 'fs-write',
           actionParams: { path: targetFile, content },
           expectedHash,
+        });
+      } else if (fileReadOp) {
+        // §9: Read operation — create fs-read plan node
+        const readFilename = fileReadOp.requestedPath;
+        if (!readFilename) {
+          return {
+            output: { planGenerated: false, reason: 'No resolvable read path' },
+            confidence: 0, evidence: [],
+            errors: [{ code: 'UNRESOLVED_INTENT', message: 'Read operation missing required path', severity: 'error', recoverable: true }],
+            consumedResources: { computeUnits: 0, memoryBytes: 0 },
+          };
+        }
+        nodes.push({
+          id: generateId('plan-node-read'),
+          objective: `Read file ${readFilename}`,
+          preconditions: [],
+          dependencies: [],
+          requiredCapabilities: [{ effectType: 'FILESYSTEM_READ' as EffectType, scope: { toolName: 'fs-read' } }],
+          authority: 'owner-authorized',
+          inputArtifacts: [],
+          expectedOutputs: [`${readFilename}-content`],
+          effects: [{ type: 'file-read', description: `Read ${readFilename}`, target: join(workspace, readFilename), expectedOutcome: 'File content read' }],
+          risk: 'LOW',
+          reversibility: 'reversible',
+          resourceBudget: { maxComputeUnits: 1, maxMemoryBytes: 1024 * 1024, maxTimeMs: 5000 },
+          timeoutMs: 10000,
+          retryPolicy: { maxRetries: 1, backoffMs: 100, retryOn: [] },
+          validation: ['content-returned'],
+          rollback: null,
+          requiresApproval: false,
+          status: 'READY',
+          actionId: 'fs-read',
+          actionParams: { path: join(workspace, readFilename) },
+        });
+      } else if (fileDeleteOp) {
+        // §9: Delete operation — create fs-delete plan node with recovery material
+        const deleteFilename = fileDeleteOp.requestedPath;
+        if (!deleteFilename) {
+          return {
+            output: { planGenerated: false, reason: 'No resolvable delete path' },
+            confidence: 0, evidence: [],
+            errors: [{ code: 'UNRESOLVED_INTENT', message: 'Delete operation missing required path', severity: 'error', recoverable: true }],
+            consumedResources: { computeUnits: 0, memoryBytes: 0 },
+          };
+        }
+        nodes.push({
+          id: generateId('plan-node-delete'),
+          objective: `Delete file ${deleteFilename}`,
+          preconditions: [],
+          dependencies: [],
+          requiredCapabilities: [{ effectType: 'FILESYSTEM_DELETE' as EffectType, scope: { toolName: 'fs-delete' } }],
+          authority: 'owner-authorized',
+          inputArtifacts: [],
+          expectedOutputs: [],
+          effects: [{ type: 'file-delete', description: `Delete ${deleteFilename}`, target: join(workspace, deleteFilename), expectedOutcome: 'File deleted' }],
+          risk: 'HIGH',
+          reversibility: 'irreversible',
+          resourceBudget: { maxComputeUnits: 1, maxMemoryBytes: 1024 * 1024, maxTimeMs: 5000 },
+          timeoutMs: 10000,
+          retryPolicy: { maxRetries: 1, backoffMs: 100, retryOn: [] },
+          validation: ['file-absent'],
+          rollback: 'fs-write-rollback',
+          requiresApproval: true,
+          status: 'READY',
+          actionId: 'fs-delete',
+          actionParams: { path: join(workspace, deleteFilename) },
         });
       } else if (goal.includes('analyze') || goal.includes('inspect') || goal.includes('examine')) {
         // Analysis-only intent — no file writes
@@ -469,17 +539,37 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
       // Capability is pre-issued by the runtime coordinator (owner-authority)
       // The action executor will check() against the capabilities Map
 
-      // Execute via action fabric using the plan node's action ID and params
+      // §15: Integrate transaction manager — begin → authorize → execute → commit
       try {
         const actionId = node.actionId ?? 'fs-write';
         const params = node.actionParams ?? {};
+        const tx = transactionManager.beginTransaction(node.objective);
+
         const result = await actionExecutor.execute(actionId, params, session.capabilityManager);
 
         // Update plan node status
         node.status = result.success ? 'COMPLETED' : 'FAILED';
 
+        // Commit transaction if successful
+        if (result.success) {
+          for (const art of result.artifacts) {
+            if (art.beforeState) {
+              transactionManager.addOperation(tx, {
+                id: `op-${art.id}`, type: art.created ? 'create' : 'modify',
+                target: art.path, before: art.beforeState,
+                after: { hash: art.hash, sizeBytes: art.sizeBytes },
+                reversible: !art.deleted,
+                recovery: { adapterId: 'fs-write', operationType: 'fs-restore', target: art.path,
+                  params: { content: (art.beforeState as any).content, hash: (art.beforeState as any).hash },
+                  beforeArtifactHash: (art.beforeState as any).hash },
+              });
+            }
+          }
+          transactionManager.commit(tx);
+        }
+
         return {
-          output: { executed: result.success, planNodeId: node.id, actionId, result },
+          output: { executed: result.success, planNodeId: node.id, actionId, result, transactionId: tx.id },
           confidence: result.success ? 0.9 : 0.0,
           evidence: result.success
             ? [`Executed ${actionId}: ${node.objective}`, ...result.artifacts.map(a => `Artifact: ${a.path} (hash=${a.hash.slice(0, 12)}...)`)]
@@ -823,6 +913,37 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
 
   // ── Agent Session ──
 
+  /** §10: Validate an execution plan before acceptance.
+   *  Checks: schema, intent traceability, action registration, dependencies, authority, rollback, risk. */
+  function validatePlan(plan: ExecutionPlan, registry: ActionRegistry, session: AgentSession): { valid: boolean; errors: string[] } {
+    const errors: string[] = [];
+    if (!plan.id) errors.push('Plan missing id');
+    if (!plan.nodes || plan.nodes.length === 0) errors.push('Plan has no nodes');
+    if (!plan.objective || plan.objective.length === 0) errors.push('Plan missing objective');
+    if (session.compiledIntent && !plan.objective.includes(session.compiledIntent.intent.goal.slice(0, 10))) {
+      errors.push('Plan objective does not reference compiled intent');
+    }
+    for (const node of plan.nodes) {
+      if (node.actionId) {
+        const action = registry.get(node.actionId);
+        if (!action) errors.push(`Plan node ${node.id}: action '${node.actionId}' not registered`);
+      }
+      for (const dep of node.dependencies) {
+        if (!plan.nodes.some(n => n.id === dep)) errors.push(`Plan node ${node.id}: dependency '${dep}' not found`);
+      }
+      if (!['owner-authorized', 'delegated', 'sub-agent'].includes(node.authority)) {
+        errors.push(`Plan node ${node.id}: invalid authority '${node.authority}'`);
+      }
+      if ((node.risk === 'HIGH' || node.risk === 'CRITICAL') && !node.rollback) {
+        errors.push(`Plan node ${node.id}: ${node.risk} risk but no rollback defined`);
+      }
+      if (!['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'].includes(node.risk)) {
+        errors.push(`Plan node ${node.id}: invalid risk level '${node.risk}'`);
+      }
+    }
+    return { valid: errors.length === 0, errors };
+  }
+
   /** §4: Ensure the policy has explicit ALLOW rules for standard agent operations */
   function ensureStandardPolicyRules(policy: import('@gspl/agent-genes').PolicyValue): import('@gspl/agent-genes').PolicyValue {    const hasFilesystemReadAllow = policy.rules.some(r => r.condition?.action === 'filesystem-read' && r.effect === 'ALLOW');
     const hasFilesystemWriteAllow = policy.rules.some(r => r.condition?.action === 'filesystem-write' && r.effect === 'ALLOW');
@@ -1044,8 +1165,16 @@ export function createRuntimeCoordinator(deps: Partial<RuntimeDependencies> & { 
             if (result.errors.length > 0) executeErrors.push(...result.errors);
             // §8: Coordinator applies the plan from organ result (non-mutating planner)
             if ((result.output as any)?.plan) {
-              currentSession.executionPlan = (result.output as any).plan;
-              currentSession = { ...currentSession, executionPlan: (result.output as any).plan };
+              const proposedPlan = (result.output as any).plan as ExecutionPlan;
+              // §10: Validate plan before acceptance
+              const planValidation = validatePlan(proposedPlan, actionRegistry, currentSession);
+              if (!planValidation.valid) {
+                observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Plan rejected: ${planValidation.errors.join('; ')}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planId: proposedPlan.id, errors: planValidation.errors } });
+                // Don't apply invalid plan
+              } else {
+                currentSession.executionPlan = proposedPlan;
+                currentSession = { ...currentSession, executionPlan: proposedPlan };
+              }
             }
           } catch (e) {
             organ.status = 'FAILED';
