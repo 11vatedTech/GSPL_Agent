@@ -600,6 +600,7 @@ export function createTestAuthorizationContext(overrides?: Partial<ActionAuthori
     intentId: 'test-intent', planId: 'test-plan', planNodeId: 'test-node',
     capabilityId: 'test-cap-0', actionId: 'fs-read', effectType: 'FILESYSTEM_READ',
     canonicalTarget: null, canonicalParameterHash: '', approvalEvidenceId: null,
+    issuanceRequestHash: '', providerId: 'test-authority',
     ...overrides,
   };
 }

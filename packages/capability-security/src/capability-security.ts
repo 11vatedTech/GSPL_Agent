@@ -169,6 +169,8 @@ export interface CapabilityManager {
   grant(request: CapabilityRequest): Capability;
   /** Accepts an externally-issued capability with approval evidence. §3 */
   acceptIssuedCapability(capability: Capability, evidence: ApprovalEvidence, requestHash: string): void;
+  /** §2: Independent verification of an approved authority decision. Validates all fields before import. */
+  acceptAuthorityDecision(envelope: CapabilityIssuanceEnvelope, locallyComputedHash: string, decision: ApprovedCapabilityDecision, verifier: AuthorityVerifier): { accepted: boolean; capabilityId: string; reason: string };
   revoke(capabilityId: string): void;
   /** Policy-first authorization check. §4 */
   check(effectType: EffectType, scope: CapabilityScope, principalId?: string, sessionId?: string, parameterHash?: string): AuthorizationResult;
@@ -236,6 +238,8 @@ export interface AuthorizationResult {
     | 'TARGET_MISMATCH'
     | 'INVALID_ISSUER'
     | 'CAPABILITY_NOT_FOUND'
+    | 'PROVIDER_MISMATCH'
+    | 'APPROVAL_EVIDENCE_MISMATCH'
     | 'NOT_CHECKED';
   reason: string;
   requiredApproval: boolean;
@@ -336,7 +340,23 @@ export function isPathWithinScope(requestedPath: string, scopePath: string): boo
 // ── Authority Provider (§2) ──
 
 export interface AuthorityProvider {
-  requestCapability(request: CapabilityIssuanceRequest): Promise<CapabilityIssuanceDecision>;
+  /** Opaque provider identity validated by the runtime. */
+  readonly providerId: string;
+  /** Request a capability. The provider must use the supplied issuanceRequestHash. */
+  requestCapability(request: CapabilityIssuanceRequest, issuanceRequestHash: string): Promise<CapabilityIssuanceDecision>;
+}
+
+/** Trusted verifier that validates approved authority decisions. */
+export interface AuthorityVerifier {
+  verify(decision: ApprovedCapabilityDecision): boolean;
+}
+
+/** Opaque nonforgeable proof of authority approval. */
+export interface AuthorityProof {
+  type: 'opaque-token' | 'mac' | 'signature';
+  value: string;
+  /** Provider identity bound to the proof */
+  providerId: string;
 }
 
 export interface CapabilityIssuanceRequest {
@@ -363,16 +383,33 @@ export interface ApprovalEvidence {
   signature?: string;
 }
 
+/** §1: Complete self-contained approved authority decision. */
+export interface ApprovedCapabilityDecision {
+  decision: 'APPROVED';
+  providerId: string;
+  decisionId: string;
+  issuanceRequestHash: string;
+  capability: Capability;
+  approvalEvidence: ApprovalEvidence;
+  decidedAt: number;
+  proof: AuthorityProof;
+}
+
 export type CapabilityIssuanceDecision =
-  | { decision: 'APPROVED'; capability: Capability; approvalEvidence: ApprovalEvidence }
+  | ApprovedCapabilityDecision
   | { decision: 'DENIED'; reason: string }
   | { decision: 'REQUIRES_OWNER_APPROVAL'; requestId: string };
 
 export function createTestAuthorityProvider(generateId: (prefix?: string) => string): AuthorityProvider {
+  const providerId = 'test-authority';
   return {
-    async requestCapability(req) {
+    providerId,
+    async requestCapability(req, _issuanceRequestHash) {
       const capId = `cap-${Date.now().toString(36)}-${generateId('auth')}`;
-      const requestHash = canonicalHash(req.effectType, req.principalId, req.sessionId, req.scope);
+      // §1: Use the coordinator-supplied issuance hash, NOT a locally recomputed one
+      const requestHash = _issuanceRequestHash
+        || req.issuanceRequestHash
+        || canonicalHash(req.effectType, req.principalId, req.sessionId, req.scope);
       const capability: Capability = {
         id: capId, name: req.name, description: '',
         effectType: req.effectType, scope: req.scope, authority: 'OWNER',
@@ -386,17 +423,22 @@ export function createTestAuthorityProvider(generateId: (prefix?: string) => str
         intentId: req.originatingIntentId ?? '',
         originatingIntentId: req.originatingIntentId,
         delegationLineage: [],
-        issuanceEvidence: { issuer: 'test-authority', timestamp: Date.now(), requestHash },
+        issuanceEvidence: { issuer: providerId, timestamp: Date.now(), requestHash },
       };
       return {
         decision: 'APPROVED',
+        providerId,
+        decisionId: 'decision-' + generateId('dec'),
+        issuanceRequestHash: requestHash,
         capability,
         approvalEvidence: {
           id: 'approval-' + generateId('ev'),
-          issuer: 'test-authority',
+          issuer: providerId,
           issuedAt: Date.now(),
           requestHash,
         },
+        decidedAt: Date.now(),
+        proof: { type: 'opaque-token', value: 'test-proof-' + capId, providerId },
       };
     },
   };
@@ -404,6 +446,7 @@ export function createTestAuthorityProvider(generateId: (prefix?: string) => str
 
 export function createDenyAllAuthorityProvider(): AuthorityProvider {
   return {
+    providerId: 'deny-all',
     async requestCapability() {
       return { decision: 'DENIED', reason: 'All capability requests denied by policy' };
     },
@@ -444,6 +487,64 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       }
       capability.issuanceEvidence = { issuer: evidence.issuer, approvalId: evidence.id, issuedAt: evidence.issuedAt, requestHash: evidence.requestHash };
       capabilities.set(capability.id, capability);
+    },
+
+    /** §2: Independent verification of authority decision hash + all binding fields. */
+    acceptAuthorityDecision(envelope, locallyComputedHash, decision, verifier) {
+      // Verify the provider identity via the verifier
+      if (!verifier.verify(decision)) {
+        return { accepted: false, capabilityId: '', reason: 'Authority verifier rejected the decision' };
+      }
+      // Verify all three hashes match
+      if (locallyComputedHash !== decision.issuanceRequestHash) {
+        return { accepted: false, capabilityId: '', reason: `Issuance hash mismatch: coordinator computed ${locallyComputedHash.slice(0,16)} vs decision ${decision.issuanceRequestHash.slice(0,16)}` };
+      }
+      if (decision.issuanceRequestHash !== decision.approvalEvidence.requestHash) {
+        return { accepted: false, capabilityId: '', reason: 'Approval evidence request hash differs from decision issuance hash' };
+      }
+      // Verify all envelope fields match the decision
+      if (decision.providerId !== envelope.providerId) {
+        return { accepted: false, capabilityId: '', reason: `Provider mismatch: envelope ${envelope.providerId} vs decision ${decision.providerId}` };
+      }
+      if (decision.proof.providerId !== envelope.providerId) {
+        return { accepted: false, capabilityId: '', reason: 'Proof providerId does not match envelope' };
+      }
+      const cap = decision.capability;
+      if (cap.principalId !== envelope.principalId) {
+        return { accepted: false, capabilityId: '', reason: 'Principal mismatch between envelope and capability' };
+      }
+      if (cap.sessionId !== envelope.sessionId) {
+        return { accepted: false, capabilityId: '', reason: 'Session mismatch between envelope and capability' };
+      }
+      if (cap.intentId !== envelope.intentId) {
+        return { accepted: false, capabilityId: '', reason: 'Intent mismatch between envelope and capability' };
+      }
+      if (cap.planId !== envelope.planId) {
+        return { accepted: false, capabilityId: '', reason: 'Plan mismatch between envelope and capability' };
+      }
+      if (cap.planNodeId !== envelope.planNodeId) {
+        return { accepted: false, capabilityId: '', reason: 'Plan node mismatch between envelope and capability' };
+      }
+      if (cap.actionId !== envelope.actionId) {
+        return { accepted: false, capabilityId: '', reason: 'Action mismatch between envelope and capability' };
+      }
+      if (cap.effectType !== envelope.effectType) {
+        return { accepted: false, capabilityId: '', reason: 'Effect type mismatch between envelope and capability' };
+      }
+      // Duplicate ID check
+      if (capabilities.has(cap.id)) {
+        return { accepted: false, capabilityId: cap.id, reason: `Duplicate capability ID: ${cap.id}` };
+      }
+      // Import the capability with issuance evidence
+      cap.issuanceEvidence = {
+        issuer: decision.providerId,
+        approvalId: decision.approvalEvidence.id,
+        decisionId: decision.decisionId,
+        issuedAt: decision.decidedAt,
+        requestHash: decision.issuanceRequestHash,
+      };
+      capabilities.set(cap.id, cap);
+      return { accepted: true, capabilityId: cap.id, reason: 'Authority decision accepted and verified' };
     },
 
     grant(request) {
@@ -612,20 +713,23 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       if (cap.revokedAt) return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'REVOKED', reason: `Capability ${cap.id} revoked`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       if (cap.expiresAt && cap.expiresAt < Date.now()) return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'EXPIRED', reason: `Capability ${cap.id} expired`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
 
-      if (context.principalId && cap.principalId !== context.principalId && cap.principalId !== '') {
-        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PRINCIPAL_MISMATCH', reason: `Principal mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      if (context.principalId && cap.principalId !== context.principalId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PRINCIPAL_MISMATCH', reason: `Principal mismatch: expected ${context.principalId}, got ${cap.principalId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      if (context.sessionId && cap.sessionId !== context.sessionId && cap.sessionId !== '') {
-        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'SESSION_MISMATCH', reason: `Session mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      if (context.sessionId && cap.sessionId !== context.sessionId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'SESSION_MISMATCH', reason: `Session mismatch: expected ${context.sessionId}, got ${cap.sessionId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      if (context.intentId && cap.intentId !== context.intentId && cap.intentId !== '' && cap.originatingIntentId !== context.intentId) {
+      if (context.intentId && cap.intentId !== context.intentId && cap.originatingIntentId !== context.intentId) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'INTENT_MISMATCH', reason: `Intent mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      if (context.planNodeId && cap.planNodeId !== context.planNodeId && cap.planNodeId !== '') {
-        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PLAN_NODE_MISMATCH', reason: `Plan node mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      if (context.planId && cap.planId !== context.planId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PLAN_MISMATCH', reason: `Plan ID mismatch: expected ${context.planId}, got ${cap.planId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      if (context.actionId && cap.actionId !== context.actionId && cap.actionId !== '') {
-        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'ACTION_MISMATCH', reason: `Action mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      if (context.planNodeId && cap.planNodeId !== context.planNodeId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PLAN_NODE_MISMATCH', reason: `Plan node mismatch: expected ${context.planNodeId}, got ${cap.planNodeId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (context.actionId && cap.actionId !== context.actionId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'ACTION_MISMATCH', reason: `Action mismatch: expected ${context.actionId}, got ${cap.actionId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
       if (context.effectType !== cap.effectType) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'SCOPE_MISMATCH', reason: `Effect type mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
@@ -744,6 +848,18 @@ export interface ThreatVector {
   severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
   mitigation: string;
   status: 'mitigated' | 'unmitigated' | 'partial' | 'monitored';
+}
+
+/** Create a test verifier that trusts a specific provider ID. */
+export function createTestAuthorityVerifier(expectedProviderId: string): AuthorityVerifier {
+  return {
+    verify(decision: ApprovedCapabilityDecision): boolean {
+      return decision.providerId === expectedProviderId
+        && decision.proof.providerId === expectedProviderId
+        && decision.proof.type === 'opaque-token'
+        && decision.proof.value.length > 0;
+    },
+  };
 }
 
 export const GSPL_AGENT_THREAT_MODEL: ThreatVector[] = [

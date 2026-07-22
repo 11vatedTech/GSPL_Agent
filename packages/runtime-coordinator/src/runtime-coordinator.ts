@@ -29,7 +29,7 @@ import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, createTestAuthorityVerifier, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type AuthorityVerifier, type CapabilityScope, type ApprovedCapabilityDecision, type ApprovalEvidence } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
@@ -126,6 +126,10 @@ export interface AgentSession {
   recoveryJournals: import('@gspl/transaction-manager').RecoveryJournalEntry[];
   currentTransactionId: string | null;
   transactionErrors: string[];
+  /** §4: Session-owned authorization state */
+  authorizationStates: Map<string, PlanNodeAuthorizationState>;
+  authorityDecisions: Map<string, import('@gspl/capability-security').ApprovedCapabilityDecision>;
+  approvalEvidence: Map<string, import('@gspl/capability-security').ApprovalEvidence>;
 }
 
 export interface AgentSessionError {
@@ -1182,6 +1186,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       recoveryJournals: [],
       currentTransactionId: null,
       transactionErrors: [],
+      // §4: Session-owned authorization state
+      authorizationStates: new Map(),
+      authorityDecisions: new Map(),
+      approvalEvidence: new Map(),
     };
   }
 
@@ -1400,7 +1408,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                     // §6: Independent issuance hash — build envelope, compute before calling provider
                     const issuanceHash = computeIssuanceRequestHash({
                       version: 1,
-                      providerId: 'test-authority',
+                      providerId: authorityProvider.providerId,
                       principalId: currentSession.sessionId,
                       sessionId: currentSession.sessionId,
                       intentId: currentSession.compiledIntent?.intent.goal ?? '',
@@ -1430,7 +1438,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       parameterHash: paramHash,
                       issuanceRequestHash: issuanceHash,
                       originatingIntentId: currentSession.compiledIntent?.intent.goal,
-                    });
+                    }, issuanceHash);
                     if (decision.decision === 'APPROVED') {
                       currentSession.capabilityManager.acceptIssuedCapability(
                         decision.capability,
@@ -1443,7 +1451,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                         approvalEvidenceId: decision.approvalEvidence?.id ?? null,
                         authorityDecisionId: (decision as any).id ?? decision.approvalEvidence?.id ?? '',
                         issuanceRequestHash: issuanceHash,
-                        providerId: 'test-authority',
+                        providerId: authorityProvider.providerId,
                         authorizedAt: clock(),
                       });
                     } else {
