@@ -517,6 +517,9 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
     },
 
     abort(tx) {
+      // §4: Validate legal transition — abort() must require a legal preterminal status
+      const violation = validateTransactionTransition(tx.status, 'ABORTED');
+      if (violation) throw new Error(violation);
       return { ...tx, status: 'ABORTED' as const, completedAt: Date.now() };
     },
 

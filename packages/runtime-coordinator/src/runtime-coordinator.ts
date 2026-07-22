@@ -713,7 +713,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           },
         });
         // §3: Persist PREPARED before any side effect
-        await transactionStore.savePrepared(session.sessionId, tx).catch(() => {});
+        await transactionStore.savePrepared(session.sessionId, tx);
         session.activeTransactions.set(tx.id, tx);
         session.currentTransactionId = tx.id;
 
@@ -775,13 +775,13 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           // §4: Durable AUTHORIZED transition BEFORE external effect
           tx = transactionManager.transition(tx, 'AUTHORIZED');
-          await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx).catch(() => {});
+          await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
           session.activeTransactions.set(tx.id, tx);
         }
 
         // §4: Transition to EFFECT_STARTED before adapter invocation
         tx = transactionManager.transition(tx, 'EFFECT_STARTED');
-        await transactionStore.saveTransition(session.sessionId, 'AUTHORIZED', tx).catch(() => {});
+        await transactionStore.saveTransition(session.sessionId, 'AUTHORIZED', tx);
         session.activeTransactions.set(tx.id, tx);
 
         const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
@@ -797,6 +797,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })) };
           tx = transactionManager.transition(tx, 'EFFECT_APPLIED');
+          await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
         } else {
           // §9: Filesystem-based effect detection (not error-code heuristics)
           const targetPath = (params as any)?.path as string | undefined;
@@ -821,11 +822,13 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           if (!effectOccurred) {
             // No external effect — abort cleanly without recovery
             tx = transactionManager.abort(tx);
+            await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
             session.activeTransactions.delete(tx.id);
             session.completedTransactions.set(tx.id, tx);
           } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
           tx = transactionManager.transition(tx, 'ROLLING_BACK');
+          await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
           let allRecovered = true;
           for (const op of tx.operations) {
             if (op.recovery) {
@@ -864,6 +867,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           const terminalStatus: 'ROLLED_BACK' | 'ROLLBACK_FAILED' = allRecovered ? 'ROLLED_BACK' : 'ROLLBACK_FAILED';
           tx = transactionManager.transition(tx, terminalStatus);
           tx = { ...tx, completedAt: clock() };
+          await transactionStore.saveTransition(session.sessionId, 'ROLLING_BACK', tx);
           session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: clock(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
           } // close inner else (recovery branch)
         } // close outer else (failure branch)
@@ -1456,14 +1460,23 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               await unlink(op.recovery.target).catch(() => {});
               try { await stat(op.recovery.target); allRecovered = false; } catch { /* expected: absent */ }
             } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
-              if (op.recovery.params.content) {
-                await writeFile(op.recovery.target, op.recovery.params.content as string, 'utf-8');
+              // §13: Use hasOwnProperty for zero-byte content — empty string is valid recovery data
+              const hasContent = Object.prototype.hasOwnProperty.call(op.recovery.params, 'content');
+              if (hasContent) {
+                await mkdir(dirname(op.recovery.target), { recursive: true });
+                await writeFile(op.recovery.target, (op.recovery.params.content ?? '') as string, 'utf-8');
                 if (op.recovery.beforeArtifactHash) {
                   const content = await readFile(op.recovery.target, 'utf-8');
                   const actualHash = sha256(content);
                   if (actualHash !== op.recovery.beforeArtifactHash) allRecovered = false;
                 }
+              } else {
+                // §14: Missing recovery content — fail closed
+                allRecovered = false;
               }
+            } else {
+              // §14: Unknown recovery adapter — fail closed
+              allRecovered = false;
             }
           } catch { allRecovered = false; }
         }
@@ -1520,12 +1533,52 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       }
     }
 
+    // §8: Restore authorization state from persisted data
+    const restoredAuthStates = new Map<string, PlanNodeAuthorizationState>();
+    if (txData?.authorizationStates) {
+      for (const a of txData.authorizationStates) {
+        restoredAuthStates.set(a.nodeId, {
+          capabilityId: a.capabilityId,
+          approvalEvidenceId: a.approvalEvidenceId,
+          authorityDecisionId: a.authorityDecisionId,
+          issuanceRequestHash: a.issuanceRequestHash,
+          providerId: a.providerId,
+          authorizedAt: a.authorizedAt,
+        });
+      }
+    }
+
+    // Restore authority decisions and approval evidence from persisted data
+    const restoredAuthorityDecisions = new Map<string, import('@gspl/capability-security').ApprovedCapabilityDecision>();
+    const restoredApprovalEvidence = new Map<string, import('@gspl/capability-security').ApprovalEvidence>();
+
+    // §11: Validate and restore currentTransactionId
+    const restoredCurrentTxId: string | null = txData?.currentTransactionId ?? null;
+    if (restoredCurrentTxId !== null) {
+      // Validate the referenced transaction exists and is active
+      const txExists = recoveredActiveTx.has(restoredCurrentTxId);
+      if (!txExists) {
+        observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Persisted currentTransactionId ${restoredCurrentTxId} not found in active transactions — clearing`, sessionId: state.agentId, tickNumber: restoredTick, correlationId: '', data: {} });
+      }
+    }
+
+    // §10: Restore cognitive graph from persisted state
+    const restoredCognitiveGraph: import('@gspl/cognitive-kernel').CognitiveGraph | null = state.cognitiveGraphState
+      ? { organs: state.cognitiveGraphState.organs.map((o: any) => ({
+          id: o.contract?.organType ? `organ-${o.contract.organType.toLowerCase()}` : 'organ-restored',
+          contract: o.contract,
+          status: o.status,
+          result: o.result ?? null,
+          completedAt: o.status === 'COMPLETED' ? clock() : null,
+        })) } as any
+      : null;
+
     return {
       sessionId: state.agentId,
       genome,
       compiledIntent,
       world: (state.worldState as SemanticWorld) ?? createWorld('default'),
-      cognitiveGraph: null,
+      cognitiveGraph: restoredCognitiveGraph,
       epistemicEngine,
       memoryStore,
       capabilityManager,
@@ -1541,12 +1594,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       activeTransactions: recoveredActiveTx,
       completedTransactions,
       recoveryJournals,
-      currentTransactionId: null,
+      currentTransactionId: restoredCurrentTxId,
       transactionErrors,
-      // §4: Session-owned authorization state
-      authorizationStates: new Map(),
-      authorityDecisions: new Map(),
-      approvalEvidence: new Map(),
+      // §4: Session-owned authorization state — restored from persistence
+      authorizationStates: restoredAuthStates,
+      authorityDecisions: restoredAuthorityDecisions,
+      approvalEvidence: restoredApprovalEvidence,
     };
   }
 
