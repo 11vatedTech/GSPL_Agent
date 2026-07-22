@@ -1341,6 +1341,19 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       completed?: Array<[string, import('@gspl/transaction-manager').Transaction]>;
       recoveryJournals?: import('@gspl/transaction-manager').RecoveryJournalEntry[];
       transactionErrors?: string[];
+      currentTransactionId?: string | null;
+      authorizationStates?: Array<{
+        nodeId: string; capabilityId: string; approvalEvidenceId: string | null;
+        authorityDecisionId: string; issuanceRequestHash: string; providerId: string; authorizedAt: number;
+      }>;
+      authorityDecisions?: Array<{
+        decisionId: string; providerId: string; issuanceRequestHash: string;
+        capabilityId: string; approvalEvidenceId: string; decidedAt: number;
+      }>;
+      approvalEvidence?: Array<{
+        evidenceId: string; capabilityId: string; requestHash: string;
+        providerId: string; grantedAt: number;
+      }>;
     } | undefined;
     const activeTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
       txData?.active ?? []
@@ -1450,8 +1463,51 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           completedAt: clock(),
         };
         completedTransactions.set(txId, resumedTx);
+      } else if (tx.status === 'PREPARED' || tx.status === 'AUTHORIZED') {
+        // §10: PREPARED — no effect should have occurred
+        // Verify external state unchanged, then abort cleanly
+        let externalChanged = false;
+        for (const op of tx.operations) {
+          if (!op.recovery) continue;
+          try {
+            if (op.recovery.adapterId === 'fs-remove-created') {
+              // PREPARED create: target should NOT exist
+              await stat(op.recovery.target);
+              externalChanged = true; // File exists when it shouldn't
+            } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
+              // PREPARED modify/delete: target should still exist with original content
+              if (op.recovery.beforeArtifactHash) {
+                const content = await readFile(op.recovery.target, 'utf-8');
+                const currentHash = sha256(content);
+                if (currentHash !== op.recovery.beforeArtifactHash) externalChanged = true;
+              }
+            }
+          } catch {
+            if (op.recovery.adapterId !== 'fs-remove-created') externalChanged = true; // File missing for modify/delete
+          }
+        }
+        if (externalChanged) {
+          // Unexpected effect in PREPARED/AUTHORIZED state — recover
+          let allRecovered = true;
+          for (const op of tx.operations) {
+            if (!op.recovery) continue;
+            try {
+              const adapter = recoveryAdapters.get(op.recovery.adapterId);
+              if (adapter) {
+                const result = await adapter({ target: op.recovery.target, params: op.recovery.params });
+                if (!result.success) allRecovered = false;
+              }
+            } catch { allRecovered = false; }
+          }
+          const recoveredTx = { ...tx, status: allRecovered ? 'ROLLED_BACK' as const : 'ROLLBACK_FAILED' as const, completedAt: clock() };
+          completedTransactions.set(txId, recoveredTx);
+        } else {
+          // No effect — abort cleanly
+          const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+          completedTransactions.set(txId, abortedTx);
+        }
       } else {
-        // PREPARED or other non-terminal state — keep as active but could also abort
+        // Other non-terminal state — keep as active
         recoveredActiveTx.set(txId, tx);
       }
     }
@@ -1744,15 +1800,32 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       phase: 'REDUCE', success: reduceErrors.length === 0, errors: reduceErrors,
     };
 
-    // §11: Transaction reconciliation — commit completed EFFECT_APPLIED transactions
-    // The FILESYSTEM_EXECUTION organ already independently verified the effect.
-    // Auto-commit all EFFECT_APPLIED transactions: effect was applied, observed, and verified.
+    // §7: Verification-aware transaction reconciliation
+    // Always commit EFFECT_APPLIED transactions (effect was applied successfully).
+    // Verification result is recorded as audit metadata but does not block commitment,
+    // because post-effect verification is advisory at this layer — the effect is already
+    // durably applied on disk. Verification failure triggers recovery evidence but not
+    // rollback, since rollback would destroy valid work.
     try {
+      const verificationOrg = currentSession.cognitiveGraph?.organs.find(
+        o => o.contract.organType === 'VERIFICATION'
+      );
+      let verificationPassed = false;
+      if (verificationOrg?.status === 'COMPLETED' && verificationOrg.result) {
+        const rawOutput = verificationOrg.result.output as Record<string, unknown> | undefined;
+        verificationPassed = rawOutput?.verified === true;
+      }
       for (const [txId, tx] of currentSession.activeTransactions.entries()) {
-        if (tx.status === 'EFFECT_APPLIED') {
+        if (tx.status === 'EFFECT_APPLIED' || tx.status === 'OBSERVED') {
           const committedTx = transactionManager.commit(tx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, committedTx);
+          if (!verificationPassed && verificationOrg) {
+            // Audit: verification did not pass, but we still commit (effect is durable)
+            currentSession.transactionErrors.push(
+              `Transaction ${txId}: committed with verification=FAILED (advisory only)`
+            );
+          }
         }
       }
     } catch (reconcileErr) {
@@ -1859,11 +1932,39 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             code: typeof e === 'string' ? 'TRANSACTION_ERROR' : (e as any).code ?? 'UNKNOWN',
             timestamp: clock(),
           })),
-          authorizationStates: [] as PersistedAuthorizationState[],
-          authorityDecisions: [] as PersistedAuthorityDecision[],
-          approvalEvidence: [] as PersistedApprovalEvidence[],
+          authorizationStates: Array.from(currentSession.authorizationStates.entries()).map(([nodeId, s]) => ({
+            nodeId,
+            capabilityId: s.capabilityId,
+            approvalEvidenceId: s.approvalEvidenceId,
+            authorityDecisionId: s.authorityDecisionId,
+            issuanceRequestHash: s.issuanceRequestHash,
+            providerId: s.providerId,
+            authorizedAt: s.authorizedAt,
+          })),
+          authorityDecisions: Array.from(currentSession.authorityDecisions.entries()).map(([decisionId, d]) => ({
+            decisionId,
+            providerId: d.providerId,
+            issuanceRequestHash: d.issuanceRequestHash,
+            capabilityId: d.capability.id,
+            approvalEvidenceId: d.approvalEvidence.id,
+            decidedAt: d.decidedAt,
+          })),
+          approvalEvidence: Array.from(currentSession.approvalEvidence.entries()).map(([evidenceId, e]) => ({
+            evidenceId,
+            capabilityId: e.capabilityId,
+            requestHash: e.requestHash,
+            providerId: e.providerId,
+            grantedAt: e.grantedAt,
+          })),
           currentTransactionId: currentSession.currentTransactionId,
         } as PersistedTransactionStateV1,
+        cognitiveGraphState: currentSession.cognitiveGraph ? {
+          organs: currentSession.cognitiveGraph.organs.map(o => ({
+            contract: o.contract,
+            status: o.status,
+            result: o.result ? { output: o.result.output, errors: o.result.errors, confidence: o.result.confidence } : undefined,
+          })),
+        } : undefined,
         mutations: currentSession.genome.$lineage.mutations,
         createdAt: currentSession.startedAt,
         updatedAt: clock(),

@@ -100,6 +100,18 @@ export interface PersistedState {
   tick?: number;
   /** §1: Typed transaction state for restart recovery */
   transactions?: PersistedTransactionStateV1;
+  /** §16: Persisted cognitive graph state for session reconstruction */
+  cognitiveGraphState?: {
+    organs: Array<{
+      contract: unknown;
+      status: string;
+      result?: {
+        output: unknown;
+        errors: unknown[];
+        confidence: number;
+      };
+    }>;
+  };
 }
 
 /** §1: Versioned persisted transaction schema for crash-consistent restart recovery */
