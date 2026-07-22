@@ -718,6 +718,19 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })), status: 'EFFECT_APPLIED' as const };
         } else {
+          // §19: Execute recovery adapters for each operation with a recovery descriptor
+          for (const op of tx.operations) {
+            if (op.recovery) {
+              const recoveryResult = await executeRecovery({
+                adapterId: op.recovery.adapterId,
+                target: op.recovery.target,
+                params: op.recovery.params,
+              });
+              if (!recoveryResult.success) {
+                session.transactionErrors.push(`Recovery failed for ${op.id} (${op.recovery.adapterId}): ${recoveryResult.error}`);
+              }
+            }
+          }
           tx = transactionManager.abort(tx);
         }
         session.activeTransactions.set(tx.id, tx);

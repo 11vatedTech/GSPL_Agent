@@ -317,13 +317,19 @@ export function createActionExecutor(
         return failResult(actionId, [{ code: 'PARAMETER_HASH_MISMATCH', message: `Canonical parameter hash mismatch: authorization ${authorization.canonicalParameterHash.slice(0, 16)}... vs computed ${recomputedHash.slice(0, 16)}...`, severity: 'fatal', recoverable: false }]);
       }
 
-      const auth = capabilityManager.check(
-        action.effectType,
-        scope,
-        authorization.principalId,
-        authorization.sessionId,
-        recomputedHash,
-      );
+      const auth = capabilityManager.checkAuthorization({
+        principalId: authorization.principalId,
+        sessionId: authorization.sessionId,
+        intentId: authorization.intentId,
+        planId: authorization.planId,
+        planNodeId: authorization.planNodeId,
+        capabilityId: authorization.capabilityId,
+        actionId,
+        effectType: action.effectType,
+        canonicalTarget: authorization.canonicalTarget,
+        canonicalParameterHash: recomputedHash,
+        approvalEvidenceId: authorization.approvalEvidenceId,
+      });
       if (!auth.authorized) {
         return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);
       }

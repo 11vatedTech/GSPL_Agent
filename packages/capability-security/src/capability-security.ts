@@ -56,10 +56,10 @@ export interface Capability {
   attenuation: AttenuationRule[];
   principalId: string;
   sessionId: string;
-  planNodeId?: string;
-  planId?: string;
-  actionId?: string;
-  intentId?: string;
+  planNodeId: string;
+  planId: string;
+  actionId: string;
+  intentId: string;
   parameterHash?: string;
   originatingIntentId?: string;
   delegationLineage: string[];
@@ -191,7 +191,10 @@ export interface CapabilityState {
   attenuation: AttenuationRule[];
   principalId: string;
   sessionId: string;
-  planNodeId?: string;
+  planNodeId: string;
+  planId: string;
+  actionId: string;
+  intentId: string;
   parameterHash?: string;
   originatingIntentId?: string;
   delegationLineage: string[];
@@ -372,9 +375,9 @@ export function createTestAuthorityProvider(generateId: (prefix?: string) => str
         expiresAt: req.ttlMs ? Date.now() + req.ttlMs : null,
         revokedAt: null, attenuation: [],
         principalId: req.principalId, sessionId: req.sessionId,
-        planNodeId: req.planNodeId, parameterHash: req.parameterHash,
-        planId: (req as any).planId, actionId: (req as any).actionId,
-        intentId: req.originatingIntentId,
+        planNodeId: req.planNodeId ?? '', parameterHash: req.parameterHash,
+        planId: (req as any).planId ?? '', actionId: (req as any).actionId ?? '',
+        intentId: req.originatingIntentId ?? '',
         originatingIntentId: req.originatingIntentId,
         delegationLineage: [],
         issuanceEvidence: { issuer: 'test-authority', timestamp: Date.now(), requestHash },
@@ -451,7 +454,10 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         revokedAt: null, attenuation: [],
         principalId: request.principalId ?? request.requestedBy,
         sessionId: request.sessionId ?? '',
-        planNodeId: request.planNodeId,
+        planNodeId: request.planNodeId ?? '',
+        planId: '',
+        actionId: '',
+        intentId: '',
         parameterHash: request.parameterHash,
         originatingIntentId: request.originatingIntentId,
         delegationLineage: [],
@@ -567,7 +573,13 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       }
 
       if (policyDecision === 'REQUIRE_APPROVAL') {
-        return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: 'Policy requires owner approval', requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id };
+        // §6: REQUIRE_APPROVAL — requires valid approval evidence ID
+        // If approval evidence is present, proceed to capability check
+        // If absent, deny with REQUIRE_APPROVAL
+        if (!context.approvalEvidenceId) {
+          return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'NOT_CHECKED', reason: `Policy requires approval but no approval evidence provided`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id };
+        }
+        // Approval evidence present — fall through to capability check
       }
 
       let cap = capabilities.get(context.capabilityId);
@@ -618,7 +630,8 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         createdAt: Date.now(), expiresAt: parent.expiresAt, revokedAt: null,
         attenuation: [...parent.attenuation, ...attenuations],
         principalId: to, sessionId: parent.sessionId,
-        planNodeId: parent.planNodeId, parameterHash: parent.parameterHash,
+        planNodeId: parent.planNodeId, planId: parent.planId, actionId: parent.actionId, intentId: parent.intentId,
+        parameterHash: parent.parameterHash,
         originatingIntentId: parent.originatingIntentId,
         delegationLineage: [...parent.delegationLineage, parent.id],
         issuanceEvidence: parent.issuanceEvidence,
@@ -633,7 +646,8 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
         authority: cap.authority, delegated: cap.delegated, delegator: cap.delegator,
         createdAt: cap.createdAt, expiresAt: cap.expiresAt, revokedAt: cap.revokedAt,
         attenuation: cap.attenuation, principalId: cap.principalId, sessionId: cap.sessionId,
-        planNodeId: cap.planNodeId, parameterHash: cap.parameterHash,
+        planNodeId: cap.planNodeId, planId: cap.planId, actionId: cap.actionId, intentId: cap.intentId,
+        parameterHash: cap.parameterHash,
         originatingIntentId: cap.originatingIntentId,
         delegationLineage: cap.delegationLineage, issuanceEvidence: cap.issuanceEvidence,
       }));
@@ -648,7 +662,8 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
           delegated: s.delegated, delegator: s.delegator,
           createdAt: s.createdAt, expiresAt: s.expiresAt, revokedAt: s.revokedAt,
           attenuation: s.attenuation, principalId: s.principalId, sessionId: s.sessionId,
-          planNodeId: s.planNodeId, parameterHash: s.parameterHash,
+          planNodeId: s.planNodeId ?? '', planId: s.planId ?? '', actionId: s.actionId ?? '', intentId: s.intentId ?? '',
+          parameterHash: s.parameterHash,
           originatingIntentId: s.originatingIntentId,
           delegationLineage: s.delegationLineage, issuanceEvidence: s.issuanceEvidence,
         };
