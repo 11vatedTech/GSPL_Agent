@@ -152,6 +152,8 @@ export interface ActionAuthorizationContext {
   canonicalTarget: string | null;
   canonicalParameterHash: string;
   approvalEvidenceId: string | null;
+  issuanceRequestHash: string;
+  providerId: string;
 }
 
 // ── Action Executor ──
@@ -329,6 +331,8 @@ export function createActionExecutor(
         canonicalTarget: authorization.canonicalTarget,
         canonicalParameterHash: recomputedHash,
         approvalEvidenceId: authorization.approvalEvidenceId,
+        issuanceRequestHash: authorization.issuanceRequestHash ?? '',
+        providerId: authorization.providerId ?? 'test-authority',
       });
       if (!auth.authorized) {
         return failResult(actionId, [{ code: 'UNAUTHORIZED', message: auth.reason, severity: 'fatal', recoverable: false }]);

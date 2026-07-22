@@ -157,6 +157,8 @@ export interface AuthorizationContext {
   canonicalTarget: string | null;
   canonicalParameterHash: string;
   approvalEvidenceId: string | null;
+  issuanceRequestHash: string;
+  providerId: string;
 }
 
 // ── Capability Manager ──
@@ -573,22 +575,34 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       }
 
       if (policyDecision === 'REQUIRE_APPROVAL') {
-        // §6: REQUIRE_APPROVAL — requires valid approval evidence ID
-        // If approval evidence is present, proceed to capability check
-        // If absent, deny with REQUIRE_APPROVAL
+        // §5: REQUIRE_APPROVAL — requires valid approval evidence bound to the exact capability
         if (!context.approvalEvidenceId) {
           return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'NOT_CHECKED', reason: `Policy requires approval but no approval evidence provided`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id };
         }
-        // Approval evidence present — fall through to capability check
+        // Verify the approval evidence exists against the expected capability
+        const cap = capabilities.get(context.capabilityId);
+        if (!cap) {
+          return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: `Policy requires approval but capability ${context.capabilityId} not found`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id };
+        }
+        // Validate approval evidence is bound to this capability
+        const evidence = cap.issuanceEvidence;
+        if (!evidence || evidence.approvalId !== context.approvalEvidenceId) {
+          return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'NOT_CHECKED', reason: `Approval evidence ${context.approvalEvidenceId} not bound to capability ${cap.id}`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+        }
+        // Validate request hash matches
+        if (context.issuanceRequestHash && evidence.requestHash !== context.issuanceRequestHash) {
+          return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'INVALID_ISSUER', reason: `Issuance request hash mismatch`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+        }
+        // Validate provider identity
+        if (context.providerId && evidence.issuer !== context.providerId) {
+          return { authorized: false, policyDecision: 'REQUIRE_APPROVAL', capabilityDecision: 'INVALID_ISSUER', reason: `Provider identity mismatch: expected ${context.providerId}, got ${evidence.issuer}`, requiredApproval: true, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+        }
+        // Approval evidence valid — fall through to full capability validation
       }
 
-      let cap = capabilities.get(context.capabilityId);
+      const cap = capabilities.get(context.capabilityId);
       if (!cap) {
-        // Fallback: search for any matching capability (for backward compat with tests)
-        cap = [...capabilities.values()].find(c => !c.revokedAt && (!c.expiresAt || c.expiresAt >= Date.now()) && c.effectType === context.effectType);
-        if (!cap) {
-          return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: `No capability with ID ${context.capabilityId}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id };
-        }
+        return { authorized: false, policyDecision: policyDecision, capabilityDecision: 'CAPABILITY_NOT_FOUND', reason: `No capability with ID ${context.capabilityId}`, requiredApproval: policyDecision === 'REQUIRE_APPROVAL', matchedRule, matchedRuleId: matchedRule?.id };
       }
 
       if (cap.revokedAt) return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'REVOKED', reason: `Capability ${cap.id} revoked`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };

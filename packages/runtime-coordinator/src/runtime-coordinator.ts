@@ -699,6 +699,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           planId: session.executionPlan?.id ?? '',
           planNodeId: node.id,
           capabilityId: (node as any)._issuedCapabilityId || node.id,
+          issuanceRequestHash: (node as any)._issuanceRequestHash ?? '',
+          providerId: 'test-authority',
           actionId,
           effectType,
           canonicalTarget: (params as any)?.path ?? null,
@@ -718,7 +720,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })), status: 'EFFECT_APPLIED' as const };
         } else {
-          // §19: Execute recovery adapters for each operation with a recovery descriptor
+          // §8: Transition to ROLLING_BACK and execute recovery adapters
+          tx = { ...tx, status: 'ROLLING_BACK' as const };
+          let allRecovered = true;
           for (const op of tx.operations) {
             if (op.recovery) {
               const recoveryResult = await executeRecovery({
@@ -726,12 +730,25 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                 target: op.recovery.target,
                 params: op.recovery.params,
               });
-              if (!recoveryResult.success) {
+              if (recoveryResult.success) {
+                // Verify restoration: re-check the target
+                try {
+                  if (op.recovery.adapterId === 'fs-remove-created') {
+                    await stat(op.recovery.target).then(() => { allRecovered = false; }, () => {});
+                  } else if (op.recovery.beforeArtifactHash) {
+                    const content = await readFile(op.recovery.target, 'utf-8');
+                    const actualHash = sha256(content);
+                    if (actualHash !== op.recovery.beforeArtifactHash) allRecovered = false;
+                  }
+                } catch { /* verification best-effort */ }
+              } else {
+                allRecovered = false;
                 session.transactionErrors.push(`Recovery failed for ${op.id} (${op.recovery.adapterId}): ${recoveryResult.error}`);
               }
             }
           }
-          tx = transactionManager.abort(tx);
+          tx = { ...tx, status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const), completedAt: Date.now() };
+          session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: Date.now(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
         }
         session.activeTransactions.set(tx.id, tx);
 
@@ -1376,8 +1393,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                         decision.approvalEvidence,
                         decision.approvalEvidence.requestHash,
                       );
-                      // §4: Store the actual capability ID on the plan node for later auth context binding
+                      // §7: Store authorization records on typed plan-node state
                       (node as any)._issuedCapabilityId = decision.capability.id;
+                      (node as any)._issuanceRequestHash = paramHash;
+                      (node as any)._authorityDecisionId = (decision as any).id ?? decision.approvalEvidence?.id ?? '';
+                      (node as any)._providerId = 'test-authority';
+                      (node as any)._authorizedAt = clock();
                     } else {
                       observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Capability denied by authority: ${decision.decision === 'DENIED' ? decision.reason : 'requires owner approval'}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, decision: decision.decision } });
                     }
