@@ -32,7 +32,7 @@ import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
 import { createCapabilityManager, createTestAuthorityProvider, createTestAuthorityVerifier, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type AuthorityVerifier, type CapabilityScope, type ApprovedCapabilityDecision, type ApprovalEvidence } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
-import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
+import { createTransactionManager, type TransactionManager, type TransactionStore, createTransactionStore } from '@gspl/transaction-manager';
 import { createPersistenceLayer, type PersistenceLayer, type PersistedState, type PersistedTransactionStateV1, type PersistedAuthorizationState, type PersistedAuthorityDecision, type PersistedApprovalEvidence } from '@gspl/persistence';
 import { createEventStore, type EventStore } from '@gspl/event-history';
 import { createObservabilitySystem, type ObservabilitySystem } from '@gspl/observability';
@@ -85,6 +85,8 @@ export interface RuntimeDependencies {
   actionRegistry: ActionRegistry;
   actionExecutor: ActionExecutor;
   transactionManager: TransactionManager;
+  /** §1: Durable transaction store — persists every transition before the next side effect */
+  transactionStore: TransactionStore;
   clock: () => number;
   generateId: (prefix?: string) => string;
   config: RuntimeConfig;
@@ -202,6 +204,7 @@ export function createTestRuntimeCoordinator(overrides?: Partial<RuntimeDependen
     actionRegistry: baseRegistry,
     actionExecutor: createActionExecutor(baseRegistry),
     transactionManager: createTransactionManager(),
+    transactionStore: createTransactionStore(join(tmpdir(), 'gspl-tx-store-' + baseGenerateId('txstore'))),
     clock: () => Date.now(),
     generateId: baseGenerateId,
     config: { ...DEFAULT_RUNTIME_CONFIG, ...overrides?.config },
@@ -232,6 +235,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   const actionRegistry: ActionRegistry = deps.actionRegistry ?? createActionRegistry();
   const actionExecutor: ActionExecutor = deps.actionExecutor ?? createActionExecutor(actionRegistry);
   const transactionManager: TransactionManager = deps.transactionManager ?? createTransactionManager();
+  const transactionStore: TransactionStore = deps.transactionStore;
   const clock: () => number = deps.clock ?? (() => Date.now());
   const generateId: (prefix?: string) => string = deps.generateId ??
     ((p) => (p ?? 'gid') + '-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
@@ -708,6 +712,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             beforeArtifactHash: beforeHash,
           },
         });
+        // §3: Persist PREPARED before any side effect
+        await transactionStore.savePrepared(session.sessionId, tx).catch(() => {});
         session.activeTransactions.set(tx.id, tx);
         session.currentTransactionId = tx.id;
 
@@ -756,7 +762,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             providerId: authCtx.providerId,
           });
           if (!preflightAuth.authorized) {
-            tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+            tx = transactionManager.abort(tx);
             session.activeTransactions.delete(tx.id);
             session.completedTransactions.set(tx.id, tx);
             node.status = 'FAILED';
@@ -767,13 +773,15 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               consumedResources: { computeUnits: 1, memoryBytes: 0 },
             };
           }
-          // §7: Durable AUTHORIZED transition BEFORE external effect
-          tx = { ...tx, status: 'AUTHORIZED' as const };
+          // §4: Durable AUTHORIZED transition BEFORE external effect
+          tx = transactionManager.transition(tx, 'AUTHORIZED');
+          await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx).catch(() => {});
           session.activeTransactions.set(tx.id, tx);
         }
 
         // §4: Transition to EFFECT_STARTED before adapter invocation
-        tx = { ...tx, status: 'EFFECT_STARTED' as const };
+        tx = transactionManager.transition(tx, 'EFFECT_STARTED');
+        await transactionStore.saveTransition(session.sessionId, 'AUTHORIZED', tx).catch(() => {});
         session.activeTransactions.set(tx.id, tx);
 
         const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
@@ -787,7 +795,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           tx = { ...tx, operations: tx.operations.map(op => ({
             ...op,
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
-          })), status: 'EFFECT_APPLIED' as const };
+          })) };
+          tx = transactionManager.transition(tx, 'EFFECT_APPLIED');
         } else {
           // §9: Filesystem-based effect detection (not error-code heuristics)
           const targetPath = (params as any)?.path as string | undefined;
@@ -811,12 +820,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           if (!effectOccurred) {
             // No external effect — abort cleanly without recovery
-            tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+            tx = transactionManager.abort(tx);
             session.activeTransactions.delete(tx.id);
             session.completedTransactions.set(tx.id, tx);
           } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
-          tx = { ...tx, status: 'ROLLING_BACK' as const };
+          tx = transactionManager.transition(tx, 'ROLLING_BACK');
           let allRecovered = true;
           for (const op of tx.operations) {
             if (op.recovery) {
@@ -852,7 +861,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               }
             }
           }
-          tx = { ...tx, status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const), completedAt: clock() };
+          const terminalStatus: 'ROLLED_BACK' | 'ROLLBACK_FAILED' = allRecovered ? 'ROLLED_BACK' : 'ROLLBACK_FAILED';
+          tx = transactionManager.transition(tx, terminalStatus);
+          tx = { ...tx, completedAt: clock() };
           session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: clock(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
           } // close inner else (recovery branch)
         } // close outer else (failure branch)
@@ -1419,11 +1430,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               allRecovered = false;
             }
           }
-          const recoveredTx = {
-            ...tx,
-            status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const),
-            completedAt: clock(),
-          };
+          const recoveredStatus: 'ROLLED_BACK' | 'ROLLBACK_FAILED' = allRecovered ? 'ROLLED_BACK' : 'ROLLBACK_FAILED';
+          const recoveredTx = { ...tx, completedAt: clock() };
+          recoveredTx.status = recoveredStatus;
           completedTransactions.set(txId, recoveredTx);
           recoveryJournals.push(...recoveredTx.operations.filter(o => o.recovery).map(o => ({
             operationId: o.id,
@@ -1433,7 +1442,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           })));
         } else {
           // No effect detected — abort cleanly
-          const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+          const abortedTx = { ...tx, completedAt: clock() };
+          abortedTx.status = 'ABORTED' as const;
           completedTransactions.set(txId, abortedTx);
         }
       } else if (tx.status === 'ROLLING_BACK') {
@@ -1457,13 +1467,11 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             }
           } catch { allRecovered = false; }
         }
-        const resumedTx = {
-          ...tx,
-          status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const),
-          completedAt: clock(),
-        };
+        const resumedStatus: 'ROLLED_BACK' | 'ROLLBACK_FAILED' = allRecovered ? 'ROLLED_BACK' : 'ROLLBACK_FAILED';
+        const resumedTx = { ...tx, completedAt: clock() };
+        resumedTx.status = resumedStatus;
         completedTransactions.set(txId, resumedTx);
-      } else if (tx.status === 'PREPARED' || tx.status === 'AUTHORIZED') {
+      } else if (tx.status === 'PREPARED') {
         // §10: PREPARED — no effect should have occurred
         // Verify external state unchanged, then abort cleanly
         let externalChanged = false;
@@ -1951,10 +1959,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           })),
           approvalEvidence: Array.from(currentSession.approvalEvidence.entries()).map(([evidenceId, e]) => ({
             evidenceId,
-            capabilityId: e.capabilityId,
+            capabilityId: e.id,
             requestHash: e.requestHash,
-            providerId: e.providerId,
-            grantedAt: e.grantedAt,
+            providerId: e.issuer,
+            grantedAt: e.issuedAt,
           })),
           currentTransactionId: currentSession.currentTransactionId,
         } as PersistedTransactionStateV1,

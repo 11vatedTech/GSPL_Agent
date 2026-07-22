@@ -10,7 +10,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile, readFile, unlink, rename } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, unlink, rename, open, stat } from 'node:fs/promises';
 import { join, dirname as pathDirname } from 'node:path';
 
 // ── Expanded Transaction States ──
@@ -107,6 +107,8 @@ export interface Transaction {
   checkpoints: Checkpoint[];
   /** Accumulated errors during rollback/compensation */
   recoveryErrors: string[];
+  /** §5: Structured observations — persisted with the transaction */
+  observations: TransactionObservation[];
 }
 
 export interface TransactionOperation {
@@ -123,6 +125,32 @@ export interface TransactionOperation {
   restore?: () => Promise<void>;
   /** In-process compensate callback (not persisted) */
   compensateFn?: () => Promise<void>;
+}
+
+// §5: Structured observation record — not just a status change
+export interface TransactionObservation {
+  id: string;
+  transactionId: string;
+  operationId: string;
+  operationType: 'create' | 'modify' | 'delete' | 'read';
+  target: string;
+  beforeExists: boolean;
+  beforeHash: string | null;
+  beforeSize: number | null;
+  afterExists: boolean;
+  afterHash: string | null;
+  afterSize: number | null;
+  expectedExists: boolean | null;
+  expectedHash: string | null;
+  classification: 'NO_EFFECT' | 'EXPECTED_EFFECT' | 'PARTIAL_EFFECT' | 'UNEXPECTED_EFFECT';
+  observedAt: number;
+  errors: ObservationError[];
+}
+
+export interface ObservationError {
+  code: string;
+  message: string;
+  target?: string;
 }
 
 export interface Checkpoint {
@@ -180,14 +208,39 @@ export function createTransactionStore(storagePath: string): TransactionStore {
     return join(storagePath, `${sessionId}-transactions.json`);
   }
 
+  /** §2: Hardened atomic write with fsync and restricted permissions */
   async function atomicWrite(filePath: string, data: string): Promise<void> {
     const tmpPath = filePath + '.' + Math.random().toString(36).slice(2) + '.tmp';
-    await writeFile(tmpPath, data, 'utf-8');
+    const fd = await open(tmpPath, 'w', 0o600);
+    try {
+      const buf = Buffer.from(data, 'utf-8');
+      await fd.write(buf, 0, buf.length, 0);
+      await fd.sync(); // fsync before atomic rename
+    } finally {
+      await fd.close();
+    }
     await rename(tmpPath, filePath);
+    // Best-effort parent directory fsync
+    try {
+      const parentFd = await open(pathDirname(filePath), 'r');
+      await parentFd.sync().catch(() => {});
+      await parentFd.close();
+    } catch { /* non-critical */ }
   }
 
+  /** §2: Serialize with schema version and content hash for integrity verification */
   function serializeTransactions(active: Transaction[], completed: Transaction[]): string {
-    return JSON.stringify({ active, completed, savedAt: Date.now() });
+    const state = {
+      schemaVersion: 1,
+      active,
+      completed,
+      savedAt: Date.now(),
+      contentHash: '',
+    };
+    // Compute content hash excluding the hash field itself
+    const { contentHash: _, ...rest } = state;
+    state.contentHash = sha256(JSON.stringify(rest));
+    return JSON.stringify(state);
   }
 
   return {
@@ -227,10 +280,33 @@ export function createTransactionStore(storagePath: string): TransactionStore {
       await atomicWrite(txPath(sessionId), serializeTransactions(existing.active, existing.completed));
     },
 
+    /** §2: Harden load with integrity verification and schema validation */
     async loadTransactions(sessionId) {
       try {
         const raw = await readFile(txPath(sessionId), 'utf-8');
         const parsed = JSON.parse(raw);
+        // §18: Validate schema structure
+        if (parsed.schemaVersion !== 1) return null;
+        // Verify content hash
+        if (parsed.contentHash) {
+          const { contentHash: storedHash, ...rest } = parsed;
+          const recomputed = sha256(JSON.stringify(rest));
+          if (storedHash !== recomputed) return null; // Corrupted — refuse to load
+        }
+        // Validate each transaction has known statuses
+        const allTxns = [...(parsed.active ?? []), ...(parsed.completed ?? [])];
+        const knownStatuses: TransactionStatus[] = [
+          'PREPARED', 'AUTHORIZED', 'ACTIVE', 'EFFECT_STARTED', 'EFFECT_APPLIED',
+          'OBSERVED', 'VALIDATED', 'COMMITTING', 'COMMITTED', 'ROLLING_BACK',
+          'ROLLED_BACK', 'PARTIALLY_ROLLED_BACK', 'ROLLBACK_FAILED',
+          'COMPENSATING', 'COMPENSATED', 'PARTIALLY_COMPENSATED', 'COMPENSATION_FAILED', 'ABORTED'
+        ];
+        for (const tx of allTxns) {
+          if (!knownStatuses.includes(tx.status)) return null;
+          // Check for duplicate IDs
+          const sameId = allTxns.filter(t => t.id === tx.id);
+          if (sameId.length > 1) return null;
+        }
         return { active: parsed.active ?? [], completed: parsed.completed ?? [] };
       } catch { return null; }
     },
@@ -271,6 +347,7 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
         operations: [],
         checkpoints: [],
         recoveryErrors: [],
+        observations: [], // §5: Initialize empty observations array
       };
     },
 
