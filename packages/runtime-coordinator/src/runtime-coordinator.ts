@@ -29,7 +29,7 @@ import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
@@ -228,6 +228,42 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
 
   // §12: Explicit test policy — exported for tests to use
   // Runtime must never silently inject policy rules during session creation.
+
+  // ── §19: Recovery Adapter Registry ──
+  // Serializable recovery adapters that operate from persisted descriptors after restart.
+  const recoveryAdapters = new Map<string, (descriptor: { target: string; params: Record<string, unknown> }) => Promise<{ success: boolean; error?: string }>>();
+
+  // fs-remove-created: delete a file that was created (rollback create)
+  recoveryAdapters.set('fs-remove-created', async (desc) => {
+    try { await unlink(desc.target); return { success: true }; }
+    catch (e) { return { success: false, error: `Remove failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
+  });
+
+  // fs-restore-modified: restore original file content (rollback modify)
+  recoveryAdapters.set('fs-restore-modified', async (desc) => {
+    try {
+      if (desc.params.content) { await writeFile(desc.target, desc.params.content as string, 'utf-8'); }
+      return { success: true };
+    } catch (e) { return { success: false, error: `Restore failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
+  });
+
+  // fs-restore-deleted: recreate deleted file (rollback delete)
+  recoveryAdapters.set('fs-restore-deleted', async (desc) => {
+    try {
+      if (desc.params.content) {
+        await mkdir(dirname(desc.target), { recursive: true });
+        await writeFile(desc.target, desc.params.content as string, 'utf-8');
+      }
+      return { success: true };
+    } catch (e) { return { success: false, error: `Restore failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
+  });
+
+  // §19: Helper — execute recovery from a persisted recovery descriptor
+  async function executeRecovery(descriptor: { adapterId: string; target: string; params: Record<string, unknown> }): Promise<{ success: boolean; error?: string }> {
+    const adapter = recoveryAdapters.get(descriptor.adapterId);
+    if (!adapter) return { success: false, error: `No recovery adapter for ${descriptor.adapterId}` };
+    return adapter(descriptor);
+  }
 
   // ── SHA-256 helper ──
   function sha256(data: string): string {
@@ -680,7 +716,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           tx = { ...tx, operations: tx.operations.map(op => ({
             ...op,
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
-          })), status: 'ACTIVE' as const };
+          })), status: 'EFFECT_APPLIED' as const };
         } else {
           tx = transactionManager.abort(tx);
         }

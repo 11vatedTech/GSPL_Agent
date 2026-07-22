@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 
 export type TransactionStatus =
   | 'ACTIVE'
+  | 'EFFECT_APPLIED'
   | 'COMMITTING'
   | 'COMMITTED'
   | 'ROLLING_BACK'

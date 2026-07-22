@@ -284,7 +284,7 @@ function validateSerializable(value: unknown, path: string, ancestors: WeakSet<o
   if (value === null || value === undefined) return;
   if (typeof value === 'function') throw new Error(`Unsupported type at ${path}: function`);
   if (typeof value === 'symbol') throw new Error(`Unsupported type at ${path}: symbol`);
-  if (typeof value === 'bigint') return;
+  if (typeof value === 'bigint') throw new Error(`Unsupported type at ${path}: bigint (use explicit string encoding)`);
   if (typeof value === 'number' && !isFinite(value)) throw new Error(`Unsupported type at ${path}: non-finite number`);
   if (typeof value === 'object') {
     if (ancestors.has(value)) throw new Error(`Cycle detected at ${path}`);
