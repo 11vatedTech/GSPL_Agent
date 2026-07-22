@@ -716,15 +716,56 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           intentId: session.compiledIntent?.intent.goal ?? '',
           planId: session.executionPlan?.id ?? '',
           planNodeId: node.id,
-          capabilityId: nodeAuthState.get(node.id)?.capabilityId || node.id,
-          issuanceRequestHash: nodeAuthState.get(node.id)?.issuanceRequestHash ?? '',
-          providerId: nodeAuthState.get(node.id)?.providerId ?? 'test-authority',
+          capabilityId: session.authorizationStates.get(node.id)?.capabilityId || nodeAuthState.get(node.id)?.capabilityId || node.id,
+          issuanceRequestHash: session.authorizationStates.get(node.id)?.issuanceRequestHash || nodeAuthState.get(node.id)?.issuanceRequestHash || '',
+          providerId: session.authorizationStates.get(node.id)?.providerId || nodeAuthState.get(node.id)?.providerId || authorityProvider.providerId,
           actionId,
           effectType,
           canonicalTarget: (params as any)?.path ?? null,
           canonicalParameterHash: canonicalHash(effectType, session.sessionId, session.sessionId, { toolName: actionId, path: (params as any)?.path }, session.compiledIntent?.intent.goal, session.executionPlan?.id, node.id, params),
-          approvalEvidenceId: null,
+          approvalEvidenceId: session.authorizationStates.get(node.id)?.approvalEvidenceId ?? null,
         };
+
+        // §7: Preflight authorization check BEFORE external effect
+        // The executor will also independently re-check, but the coordinator must
+        // durably record AUTHORIZED before the adapter is invoked.
+        // NOTE: Authority may not have been issued yet (authority issuance runs after
+        // organ execution). When auth state exists, enforce it; otherwise skip preflight
+        // and let the executor's own checkAuthorization() handle the gate.
+        const authState = session.authorizationStates.get(node.id) || nodeAuthState.get(node.id);
+        const hasAuthState = !!authState && authState.capabilityId && authState.capabilityId !== node.id;
+        if (hasAuthState) {
+          const preflightAuth = session.capabilityManager.checkAuthorization({
+            principalId: authCtx.principalId,
+            sessionId: authCtx.sessionId,
+            intentId: authCtx.intentId,
+            planId: authCtx.planId,
+            planNodeId: authCtx.planNodeId,
+            capabilityId: authCtx.capabilityId,
+            actionId: authCtx.actionId,
+            effectType: authCtx.effectType,
+            canonicalTarget: authCtx.canonicalTarget,
+            canonicalParameterHash: authCtx.canonicalParameterHash,
+            approvalEvidenceId: authCtx.approvalEvidenceId,
+            issuanceRequestHash: authCtx.issuanceRequestHash,
+            providerId: authCtx.providerId,
+          });
+          if (!preflightAuth.authorized) {
+            tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+            session.activeTransactions.set(tx.id, tx);
+            node.status = 'FAILED';
+            return {
+              output: { executed: false, planNodeId: node.id, reason: `Preflight authorization failed: ${preflightAuth.reason}` },
+              confidence: 0, evidence: [],
+              errors: [{ code: 'PREFLIGHT_UNAUTHORIZED', message: preflightAuth.reason, severity: 'fatal', recoverable: false }],
+              consumedResources: { computeUnits: 1, memoryBytes: 0 },
+            };
+          }
+          // §7: Durable AUTHORIZED transition BEFORE external effect
+          tx = { ...tx, status: 'AUTHORIZED' as const };
+          session.activeTransactions.set(tx.id, tx);
+        }
+
         const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
 
         // Update plan node status
@@ -733,17 +774,34 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         // §17: Update transaction after-state but do NOT commit
         // Commit happens after observation + verification in the coordinator
         if (result.success) {
-          tx = { ...tx, status: 'AUTHORIZED' as const };
           tx = { ...tx, operations: tx.operations.map(op => ({
             ...op,
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })), status: 'EFFECT_APPLIED' as const };
         } else {
-          // §8: Check whether an external effect occurred before rolling back
-          const effectOccurred = result.errors.some((e: any) => e.code !== 'UNAUTHORIZED' && e.code !== 'AUTHORIZATION_CONTEXT_MISSING');
-          if (!effectOccurred && node.rollback === 'fs-remove-created') {
-            // No file was created — abort cleanly without recovery
-            tx = { ...tx, status: 'ABORTED' as const, completedAt: Date.now() };
+          // §9: Filesystem-based effect detection (not error-code heuristics)
+          const targetPath = (params as any)?.path as string | undefined;
+          let effectOccurred = false;
+          if (targetPath) {
+            if (node.rollback === 'fs-remove-created') {
+              // Create: effect occurred if file now exists
+              try { await stat(targetPath); effectOccurred = true; } catch { /* file absent */ }
+            } else if (node.rollback === 'fs-restore-modified') {
+              // Modify: effect occurred if file content differs from before
+              try {
+                const currentContent = await readFile(targetPath, 'utf-8');
+                const currentHash = sha256(currentContent);
+                if (beforeHash && currentHash !== beforeHash) effectOccurred = true;
+                else if (!beforeHash) effectOccurred = true; // No before-state captured
+              } catch { /* file went missing */ }
+            } else if (node.rollback === 'fs-restore-deleted') {
+              // Delete: effect occurred if file is now absent
+              try { await stat(targetPath); /* file still exists */ } catch { effectOccurred = true; }
+            }
+          }
+          if (!effectOccurred) {
+            // No external effect — abort cleanly without recovery
+            tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
           } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
           tx = { ...tx, status: 'ROLLING_BACK' as const };
@@ -755,25 +813,35 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                 target: op.recovery.target,
                 params: op.recovery.params,
               });
-              if (recoveryResult.success) {
-                // Verify restoration: re-check the target
-                try {
-                  if (op.recovery.adapterId === 'fs-remove-created') {
-                    await stat(op.recovery.target).then(() => { allRecovered = false; }, () => {});
-                  } else if (op.recovery.beforeArtifactHash) {
-                    const content = await readFile(op.recovery.target, 'utf-8');
-                    const actualHash = sha256(content);
-                    if (actualHash !== op.recovery.beforeArtifactHash) allRecovered = false;
-                  }
-                } catch { /* verification best-effort */ }
-              } else {
+              if (!recoveryResult.success) {
                 allRecovered = false;
                 session.transactionErrors.push(`Recovery failed for ${op.id} (${op.recovery.adapterId}): ${recoveryResult.error}`);
+                continue;
+              }
+              // §10: Fail-closed recovery verification — no best-effort suppression
+              let verifyError: string | null = null;
+              try {
+                if (op.recovery.adapterId === 'fs-remove-created') {
+                  // Created file must be absent after recovery
+                  try { await stat(op.recovery.target); verifyError = 'File still exists after fs-remove-created recovery'; } catch { /* expected: file absent */ }
+                } else if (op.recovery.beforeArtifactHash) {
+                  const content = await readFile(op.recovery.target, 'utf-8');
+                  const actualHash = sha256(content);
+                  if (actualHash !== op.recovery.beforeArtifactHash) {
+                    verifyError = `Restored hash mismatch: expected ${op.recovery.beforeArtifactHash.slice(0, 12)}, got ${actualHash.slice(0, 12)}`;
+                  }
+                }
+              } catch (verifyErr) {
+                verifyError = `Verification error: ${verifyErr instanceof Error ? verifyErr.message : 'unknown'}`;
+              }
+              if (verifyError) {
+                allRecovered = false;
+                session.transactionErrors.push(`Recovery verification failed for ${op.id}: ${verifyError}`);
               }
             }
           }
-          tx = { ...tx, status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const), completedAt: Date.now() };
-          session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: Date.now(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
+          tx = { ...tx, status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const), completedAt: clock() };
+          session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: clock(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
           } // close inner else (recovery branch)
         } // close outer else (failure branch)
         session.activeTransactions.set(tx.id, tx);
@@ -1271,6 +1339,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       recoveryJournals: [],
       currentTransactionId: null,
       transactionErrors: [],
+      // §4: Session-owned authorization state
+      authorizationStates: new Map(),
+      authorityDecisions: new Map(),
+      approvalEvidence: new Map(),
     };
   }
 
