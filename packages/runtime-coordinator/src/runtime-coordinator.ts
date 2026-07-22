@@ -29,7 +29,7 @@ import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type CapabilityScope } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
@@ -158,6 +158,17 @@ export interface CompletionVerification {
   confidence: number;
 }
 
+// ── §7: Plan Node Authorization State ──
+// Typed storage for authorization records, replacing (node as any)._issuedCapabilityId
+export interface PlanNodeAuthorizationState {
+  capabilityId: string;
+  approvalEvidenceId: string | null;
+  authorityDecisionId: string;
+  issuanceRequestHash: string;
+  providerId: string;
+  authorizedAt: number;
+}
+
 // §12: Explicit test policy with standard filesystem ALLOW rules at high priority
 export const DEFAULT_TEST_POLICY: PolicyValue = {
   rules: [
@@ -228,6 +239,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
 
   // §12: Explicit test policy — exported for tests to use
   // Runtime must never silently inject policy rules during session creation.
+
+  // §7: Plan node authorization state — typed Map replacing (node as any) casts
+  const nodeAuthState = new Map<string, PlanNodeAuthorizationState>();
 
   // ── §19: Recovery Adapter Registry ──
   // Serializable recovery adapters that operate from persisted descriptors after restart.
@@ -698,9 +712,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           intentId: session.compiledIntent?.intent.goal ?? '',
           planId: session.executionPlan?.id ?? '',
           planNodeId: node.id,
-          capabilityId: (node as any)._issuedCapabilityId || node.id,
-          issuanceRequestHash: (node as any)._issuanceRequestHash ?? '',
-          providerId: 'test-authority',
+          capabilityId: nodeAuthState.get(node.id)?.capabilityId || node.id,
+          issuanceRequestHash: nodeAuthState.get(node.id)?.issuanceRequestHash ?? '',
+          providerId: nodeAuthState.get(node.id)?.providerId ?? 'test-authority',
           actionId,
           effectType,
           canonicalTarget: (params as any)?.path ?? null,
@@ -715,11 +729,18 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         // §17: Update transaction after-state but do NOT commit
         // Commit happens after observation + verification in the coordinator
         if (result.success) {
+          tx = { ...tx, status: 'AUTHORIZED' as const };
           tx = { ...tx, operations: tx.operations.map(op => ({
             ...op,
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })), status: 'EFFECT_APPLIED' as const };
         } else {
+          // §8: Check whether an external effect occurred before rolling back
+          const effectOccurred = result.errors.some((e: any) => e.code !== 'UNAUTHORIZED' && e.code !== 'AUTHORIZATION_CONTEXT_MISSING');
+          if (!effectOccurred && node.rollback === 'fs-remove-created') {
+            // No file was created — abort cleanly without recovery
+            tx = { ...tx, status: 'ABORTED' as const, completedAt: Date.now() };
+          } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
           tx = { ...tx, status: 'ROLLING_BACK' as const };
           let allRecovered = true;
@@ -749,7 +770,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           tx = { ...tx, status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const), completedAt: Date.now() };
           session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: Date.now(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
-        }
+          } // close inner else (recovery branch)
+        } // close outer else (failure branch)
         session.activeTransactions.set(tx.id, tx);
 
         return {
@@ -1375,6 +1397,26 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       node.id,
                       node.actionParams,
                     );
+                    // §6: Independent issuance hash — build envelope, compute before calling provider
+                    const issuanceHash = computeIssuanceRequestHash({
+                      version: 1,
+                      providerId: 'test-authority',
+                      principalId: currentSession.sessionId,
+                      sessionId: currentSession.sessionId,
+                      intentId: currentSession.compiledIntent?.intent.goal ?? '',
+                      planId: currentSession.executionPlan?.id ?? '',
+                      planNodeId: node.id,
+                      actionId: node.actionId ?? '',
+                      effectType: capReq.effectType,
+                      canonicalTarget: (node.actionParams as any)?.['path'] as string | null ?? null,
+                      canonicalParameters: node.actionParams ?? {},
+                      canonicalParameterHash: paramHash,
+                      requestedScope: { toolName: node.actionId, path: (node.actionParams as any)?.['path'] as string | undefined },
+                      risk: node.risk,
+                      reversibility: node.reversibility ?? 'reversible',
+                      requiresApproval: node.requiresApproval ?? false,
+                      requestedTtlMs: null,
+                    });
                     const decision = await authorityProvider.requestCapability({
                       name: node.id,
                       effectType: capReq.effectType,
@@ -1384,21 +1426,26 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       planNodeId: node.id,
                       planId: currentSession.executionPlan?.id,
                       actionId: node.actionId,
+                      intentId: currentSession.compiledIntent?.intent.goal,
                       parameterHash: paramHash,
+                      issuanceRequestHash: issuanceHash,
                       originatingIntentId: currentSession.compiledIntent?.intent.goal,
-                    } as any);
+                    });
                     if (decision.decision === 'APPROVED') {
                       currentSession.capabilityManager.acceptIssuedCapability(
                         decision.capability,
                         decision.approvalEvidence,
                         decision.approvalEvidence.requestHash,
                       );
-                      // §7: Store authorization records on typed plan-node state
-                      (node as any)._issuedCapabilityId = decision.capability.id;
-                      (node as any)._issuanceRequestHash = paramHash;
-                      (node as any)._authorityDecisionId = (decision as any).id ?? decision.approvalEvidence?.id ?? '';
-                      (node as any)._providerId = 'test-authority';
-                      (node as any)._authorizedAt = clock();
+                      // §7: Store authorization records in typed Map
+                      nodeAuthState.set(node.id, {
+                        capabilityId: decision.capability.id,
+                        approvalEvidenceId: decision.approvalEvidence?.id ?? null,
+                        authorityDecisionId: (decision as any).id ?? decision.approvalEvidence?.id ?? '',
+                        issuanceRequestHash: issuanceHash,
+                        providerId: 'test-authority',
+                        authorizedAt: clock(),
+                      });
                     } else {
                       observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Capability denied by authority: ${decision.decision === 'DENIED' ? decision.reason : 'requires owner approval'}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, decision: decision.decision } });
                     }

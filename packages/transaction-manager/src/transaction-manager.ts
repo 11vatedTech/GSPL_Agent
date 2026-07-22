@@ -14,6 +14,8 @@ import { createHash } from 'node:crypto';
 // ── Expanded Transaction States ──
 
 export type TransactionStatus =
+  | 'PREPARED'
+  | 'AUTHORIZED'
   | 'ACTIVE'
   | 'EFFECT_APPLIED'
   | 'COMMITTING'
@@ -140,7 +142,7 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
     beginTransaction(_label = '') {
       return {
         id: 'tx-' + Date.now().toString(36),
-        status: 'ACTIVE',
+        status: 'PREPARED',
         startedAt: Date.now(),
         completedAt: null,
         operations: [],

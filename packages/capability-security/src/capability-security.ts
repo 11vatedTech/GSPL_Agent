@@ -346,8 +346,12 @@ export interface CapabilityIssuanceRequest {
   principalId: string;
   sessionId: string;
   planNodeId?: string;
+  planId?: string;
+  actionId?: string;
+  intentId?: string;
   parameterHash?: string;
   originatingIntentId?: string;
+  issuanceRequestHash?: string;
   ttlMs?: number;
 }
 

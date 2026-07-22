@@ -11,7 +11,7 @@ describe('Transaction Manager', () => {
   it('begins a transaction', () => {
     const tx = tm.beginTransaction('test');
     expect(tx.id).toBeDefined();
-    expect(tx.status).toBe('ACTIVE');
+    expect(tx.status).toBe('PREPARED');
     expect(tx.operations.length).toBe(0);
   });
 
