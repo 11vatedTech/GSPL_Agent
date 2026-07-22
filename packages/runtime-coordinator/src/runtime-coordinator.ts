@@ -33,7 +33,7 @@ import { createCapabilityManager, createTestAuthorityProvider, createTestAuthori
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager } from '@gspl/transaction-manager';
-import { createPersistenceLayer, type PersistenceLayer, type PersistedState } from '@gspl/persistence';
+import { createPersistenceLayer, type PersistenceLayer, type PersistedState, type PersistedTransactionStateV1, type PersistedAuthorizationState, type PersistedAuthorityDecision, type PersistedApprovalEvidence } from '@gspl/persistence';
 import { createEventStore, type EventStore } from '@gspl/event-history';
 import { createObservabilitySystem, type ObservabilitySystem } from '@gspl/observability';
 import { createVerificationEngine, type VerificationEngine, type VerificationResult } from '@gspl/verification-engine';
@@ -251,16 +251,20 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   // Serializable recovery adapters that operate from persisted descriptors after restart.
   const recoveryAdapters = new Map<string, (descriptor: { target: string; params: Record<string, unknown> }) => Promise<{ success: boolean; error?: string }>>();
 
+  // §11: Idempotent recovery adapters — safe to call repeatedly after crash
   // fs-remove-created: delete a file that was created (rollback create)
   recoveryAdapters.set('fs-remove-created', async (desc) => {
-    try { await unlink(desc.target); return { success: true }; }
-    catch (e) { return { success: false, error: `Remove failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
+    try {
+      try { await unlink(desc.target); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+      return { success: true };
+    } catch (e) { return { success: false, error: `Remove failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
   });
 
   // fs-restore-modified: restore original file content (rollback modify)
   recoveryAdapters.set('fs-restore-modified', async (desc) => {
     try {
-      if (desc.params.content) { await writeFile(desc.target, desc.params.content as string, 'utf-8'); }
+      const hasContent = Object.prototype.hasOwnProperty.call(desc.params, 'content');
+      if (hasContent) { await writeFile(desc.target, (desc.params.content ?? '') as string, 'utf-8'); }
       return { success: true };
     } catch (e) { return { success: false, error: `Restore failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
   });
@@ -268,9 +272,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   // fs-restore-deleted: recreate deleted file (rollback delete)
   recoveryAdapters.set('fs-restore-deleted', async (desc) => {
     try {
-      if (desc.params.content) {
+      const hasContent = Object.prototype.hasOwnProperty.call(desc.params, 'content');
+      if (hasContent) {
         await mkdir(dirname(desc.target), { recursive: true });
-        await writeFile(desc.target, desc.params.content as string, 'utf-8');
+        await writeFile(desc.target, (desc.params.content ?? '') as string, 'utf-8');
       }
       return { success: true };
     } catch (e) { return { success: false, error: `Restore failed: ${e instanceof Error ? e.message : 'unknown'}` }; }
@@ -766,6 +771,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           tx = { ...tx, status: 'AUTHORIZED' as const };
           session.activeTransactions.set(tx.id, tx);
         }
+
+        // §4: Transition to EFFECT_STARTED before adapter invocation
+        tx = { ...tx, status: 'EFFECT_STARTED' as const };
+        session.activeTransactions.set(tx.id, tx);
 
         const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
 
@@ -1381,9 +1390,11 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                 await unlink(op.recovery.target).catch(() => {});
                 try { await stat(op.recovery.target); allRecovered = false; } catch { /* expected: absent */ }
               } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
-                if (op.recovery.params.content) {
+                // §9: Use hasOwnProperty for empty content — empty string is valid recovery data
+                const hasContent = Object.prototype.hasOwnProperty.call(op.recovery.params, 'content');
+                if (hasContent) {
                   await mkdir(dirname(op.recovery.target), { recursive: true });
-                  await writeFile(op.recovery.target, op.recovery.params.content as string, 'utf-8');
+                  await writeFile(op.recovery.target, (op.recovery.params.content ?? '') as string, 'utf-8');
                   if (op.recovery.beforeArtifactHash) {
                     const content = await readFile(op.recovery.target, 'utf-8');
                     const actualHash = sha256(content);
@@ -1810,11 +1821,49 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         checkpoints: checkpointData,
         // §8: Persist complete transaction state
         transactions: {
-          active: Array.from(currentSession.activeTransactions.entries()),
-          completed: Array.from(currentSession.completedTransactions.entries()),
-          recoveryJournals: currentSession.recoveryJournals,
-          transactionErrors: currentSession.transactionErrors,
-        },
+          schemaVersion: 1,
+          active: Array.from(currentSession.activeTransactions.entries()).map(([id, tx]) => ({
+            id: tx.id,
+            status: tx.status,
+            startedAt: tx.startedAt,
+            completedAt: tx.completedAt,
+            operations: tx.operations.map(op => ({
+              id: op.id, type: op.type, target: op.target,
+              before: op.before, after: op.after, reversible: op.reversible,
+              compensation: op.compensation,
+              recovery: op.recovery ? { adapterId: op.recovery.adapterId, operationType: op.recovery.operationType, target: op.recovery.target, params: op.recovery.params, beforeArtifactHash: op.recovery.beforeArtifactHash } : undefined,
+            })),
+            recoveryErrors: tx.recoveryErrors,
+          })),
+          completed: Array.from(currentSession.completedTransactions.entries()).map(([id, tx]) => ({
+            id: tx.id,
+            status: tx.status,
+            startedAt: tx.startedAt,
+            completedAt: tx.completedAt,
+            operations: tx.operations.map(op => ({
+              id: op.id, type: op.type, target: op.target,
+              before: op.before, after: op.after, reversible: op.reversible,
+              compensation: op.compensation,
+              recovery: op.recovery ? { adapterId: op.recovery.adapterId, operationType: op.recovery.operationType, target: op.recovery.target, params: op.recovery.params, beforeArtifactHash: op.recovery.beforeArtifactHash } : undefined,
+            })),
+            recoveryErrors: tx.recoveryErrors,
+          })),
+          recoveryJournals: currentSession.recoveryJournals.map(rj => ({
+            operationId: rj.operationId,
+            adapterId: rj.recovery.adapterId,
+            timestamp: rj.timestamp,
+            status: rj.status,
+          })),
+          transactionErrors: currentSession.transactionErrors.map(e => ({
+            message: typeof e === 'string' ? e : (e as any).message ?? String(e),
+            code: typeof e === 'string' ? 'TRANSACTION_ERROR' : (e as any).code ?? 'UNKNOWN',
+            timestamp: clock(),
+          })),
+          authorizationStates: [] as PersistedAuthorizationState[],
+          authorityDecisions: [] as PersistedAuthorityDecision[],
+          approvalEvidence: [] as PersistedApprovalEvidence[],
+          currentTransactionId: currentSession.currentTransactionId,
+        } as PersistedTransactionStateV1,
         mutations: currentSession.genome.$lineage.mutations,
         createdAt: currentSession.startedAt,
         updatedAt: clock(),

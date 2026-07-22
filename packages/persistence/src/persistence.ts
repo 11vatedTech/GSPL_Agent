@@ -98,8 +98,87 @@ export interface PersistedState {
   workspaceRoot?: string;
   /** Session tick counter */
   tick?: number;
-  /** Transaction state for restart recovery */
-  transactions?: unknown;
+  /** §1: Typed transaction state for restart recovery */
+  transactions?: PersistedTransactionStateV1;
+}
+
+/** §1: Versioned persisted transaction schema for crash-consistent restart recovery */
+export interface PersistedTransactionStateV1 {
+  schemaVersion: 1;
+  active: PersistedTransactionV1[];
+  completed: PersistedTransactionV1[];
+  recoveryJournals: PersistedRecoveryJournalEntry[];
+  transactionErrors: PersistedTransactionError[];
+  authorizationStates: PersistedAuthorizationState[];
+  authorityDecisions: PersistedAuthorityDecision[];
+  approvalEvidence: PersistedApprovalEvidence[];
+  currentTransactionId: string | null;
+}
+
+export interface PersistedTransactionV1 {
+  id: string;
+  status: string;
+  startedAt: number;
+  completedAt: number | null;
+  operations: PersistedTransactionOperationV1[];
+  recoveryErrors: string[];
+}
+
+export interface PersistedTransactionOperationV1 {
+  id: string;
+  type: string;
+  target: string;
+  before: unknown | null;
+  after: unknown | null;
+  reversible: boolean;
+  compensation?: string;
+  recovery?: {
+    adapterId: string;
+    operationType: string;
+    target: string;
+    params: Record<string, unknown>;
+    beforeArtifactHash?: string;
+  };
+}
+
+export interface PersistedRecoveryJournalEntry {
+  operationId: string;
+  adapterId: string;
+  timestamp: number;
+  status: 'pending' | 'executed' | 'failed';
+}
+
+export interface PersistedTransactionError {
+  message: string;
+  code: string;
+  timestamp: number;
+}
+
+export interface PersistedAuthorizationState {
+  nodeId: string;
+  capabilityId: string;
+  approvalEvidenceId: string | null;
+  authorityDecisionId: string;
+  issuanceRequestHash: string;
+  providerId: string;
+  authorizedAt: number;
+}
+
+export interface PersistedAuthorityDecision {
+  decisionId: string;
+  providerId: string;
+  issuanceRequestHash: string;
+  capabilityId: string;
+  approvalEvidenceId: string;
+  decidedAt: number;
+}
+
+export interface PersistedApprovalEvidence {
+  evidenceId: string;
+  capabilityId: string;
+  requestHash: string;
+  providerId: string;
+  grantedAt: number;
 }
 
 export interface PersistenceConfig {
