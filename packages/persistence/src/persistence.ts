@@ -98,6 +98,8 @@ export interface PersistedState {
   workspaceRoot?: string;
   /** Session tick counter */
   tick?: number;
+  /** Transaction state for restart recovery */
+  transactions?: unknown;
 }
 
 export interface PersistenceConfig {

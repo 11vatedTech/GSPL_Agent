@@ -752,7 +752,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           });
           if (!preflightAuth.authorized) {
             tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
-            session.activeTransactions.set(tx.id, tx);
+            session.activeTransactions.delete(tx.id);
+            session.completedTransactions.set(tx.id, tx);
             node.status = 'FAILED';
             return {
               output: { executed: false, planNodeId: node.id, reason: `Preflight authorization failed: ${preflightAuth.reason}` },
@@ -802,6 +803,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           if (!effectOccurred) {
             // No external effect — abort cleanly without recovery
             tx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+            session.activeTransactions.delete(tx.id);
+            session.completedTransactions.set(tx.id, tx);
           } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
           tx = { ...tx, status: 'ROLLING_BACK' as const };
@@ -844,7 +847,14 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: clock(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
           } // close inner else (recovery branch)
         } // close outer else (failure branch)
-        session.activeTransactions.set(tx.id, tx);
+        // §8: Move terminal transactions to completedTransactions
+        const isTerminal = tx.status === 'COMMITTED' || tx.status === 'ROLLED_BACK' || tx.status === 'ROLLBACK_FAILED' || tx.status === 'ABORTED';
+        if (isTerminal) {
+          session.activeTransactions.delete(tx.id);
+          session.completedTransactions.set(tx.id, tx);
+        } else {
+          session.activeTransactions.set(tx.id, tx);
+        }
 
         return {
           output: { executed: result.success, planNodeId: node.id, actionId, result, transactionId: tx.id },
@@ -1316,6 +1326,125 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     // Restore the actual session tick from persisted state
     const restoredTick = (state as any).tick ?? genome.$lineage.tick ?? 0;
 
+    // Restore transaction state
+    const txData = (state as any).transactions as {
+      active?: Array<[string, import('@gspl/transaction-manager').Transaction]>;
+      completed?: Array<[string, import('@gspl/transaction-manager').Transaction]>;
+      recoveryJournals?: import('@gspl/transaction-manager').RecoveryJournalEntry[];
+      transactionErrors?: string[];
+    } | undefined;
+    const activeTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+      txData?.active ?? []
+    );
+    const completedTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+      txData?.completed ?? []
+    );
+    const recoveryJournals = txData?.recoveryJournals ?? [];
+    const transactionErrors = txData?.transactionErrors ?? [];
+
+    // §12: Recover incomplete transactions after restart
+    // Detect active transactions that were interrupted and inspect external state
+    const recoveredActiveTx = new Map<string, import('@gspl/transaction-manager').Transaction>();
+    for (const [txId, tx] of activeTransactions) {
+      if (tx.status === 'EFFECT_APPLIED' || tx.status === 'AUTHORIZED' || tx.status === 'ACTIVE') {
+        // Inspect external state for each operation to determine if effect occurred
+        let requiresRecovery = false;
+        for (const op of tx.operations) {
+          if (!op.recovery) continue;
+          try {
+            await stat(op.recovery.target);
+            // File exists — check if effect occurred (create: exists, modify: different hash, delete: absent)
+            if (op.recovery.adapterId === 'fs-restore-modified') {
+              const content = await readFile(op.recovery.target, 'utf-8');
+              const currentHash = sha256(content);
+              if (op.recovery.beforeArtifactHash && currentHash !== op.recovery.beforeArtifactHash) {
+                requiresRecovery = true;
+              }
+            } else if (op.recovery.adapterId === 'fs-remove-created') {
+              requiresRecovery = true; // File was created, need to remove
+            }
+            // For fs-restore-deleted: file exists means either not deleted yet or restored
+          } catch {
+            // File absent — for delete recovery, this is expected; for create, no effect
+            if (op.recovery.adapterId === 'fs-restore-deleted') {
+              requiresRecovery = true; // File was deleted, need to restore
+            }
+          }
+        }
+        if (requiresRecovery) {
+          // Execute recovery for interrupted transaction
+          let allRecovered = true;
+          for (const op of tx.operations) {
+            if (!op.recovery) continue;
+            try {
+              if (op.recovery.adapterId === 'fs-remove-created') {
+                await unlink(op.recovery.target).catch(() => {});
+                try { await stat(op.recovery.target); allRecovered = false; } catch { /* expected: absent */ }
+              } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
+                if (op.recovery.params.content) {
+                  await mkdir(dirname(op.recovery.target), { recursive: true });
+                  await writeFile(op.recovery.target, op.recovery.params.content as string, 'utf-8');
+                  if (op.recovery.beforeArtifactHash) {
+                    const content = await readFile(op.recovery.target, 'utf-8');
+                    const actualHash = sha256(content);
+                    if (actualHash !== op.recovery.beforeArtifactHash) allRecovered = false;
+                  }
+                }
+              }
+            } catch (recoveryErr) {
+              allRecovered = false;
+            }
+          }
+          const recoveredTx = {
+            ...tx,
+            status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const),
+            completedAt: clock(),
+          };
+          completedTransactions.set(txId, recoveredTx);
+          recoveryJournals.push(...recoveredTx.operations.filter(o => o.recovery).map(o => ({
+            operationId: o.id,
+            recovery: o.recovery!,
+            timestamp: clock(),
+            status: allRecovered ? ('executed' as const) : ('failed' as const),
+          })));
+        } else {
+          // No effect detected — abort cleanly
+          const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+          completedTransactions.set(txId, abortedTx);
+        }
+      } else if (tx.status === 'ROLLING_BACK') {
+        // Resume incomplete recovery
+        let allRecovered = true;
+        for (const op of tx.operations) {
+          if (!op.recovery) continue;
+          try {
+            if (op.recovery.adapterId === 'fs-remove-created') {
+              await unlink(op.recovery.target).catch(() => {});
+              try { await stat(op.recovery.target); allRecovered = false; } catch { /* expected: absent */ }
+            } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
+              if (op.recovery.params.content) {
+                await writeFile(op.recovery.target, op.recovery.params.content as string, 'utf-8');
+                if (op.recovery.beforeArtifactHash) {
+                  const content = await readFile(op.recovery.target, 'utf-8');
+                  const actualHash = sha256(content);
+                  if (actualHash !== op.recovery.beforeArtifactHash) allRecovered = false;
+                }
+              }
+            }
+          } catch { allRecovered = false; }
+        }
+        const resumedTx = {
+          ...tx,
+          status: allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const),
+          completedAt: clock(),
+        };
+        completedTransactions.set(txId, resumedTx);
+      } else {
+        // PREPARED or other non-terminal state — keep as active but could also abort
+        recoveredActiveTx.set(txId, tx);
+      }
+    }
+
     return {
       sessionId: state.agentId,
       genome,
@@ -1333,12 +1462,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       checkpointId: agentId,
       executionPlan,
       workspaceRoot: state.workspaceRoot ?? join(tmpdir(), 'gspl-workspace-restored'),
-      // §15: Transaction state
-      activeTransactions: new Map(),
-      completedTransactions: new Map(),
-      recoveryJournals: [],
+      // §15: Transaction state — restored from persistence
+      activeTransactions: recoveredActiveTx,
+      completedTransactions,
+      recoveryJournals,
       currentTransactionId: null,
-      transactionErrors: [],
+      transactionErrors,
       // §4: Session-owned authorization state
       authorizationStates: new Map(),
       authorityDecisions: new Map(),
@@ -1604,6 +1733,21 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       phase: 'REDUCE', success: reduceErrors.length === 0, errors: reduceErrors,
     };
 
+    // §11: Transaction reconciliation — commit completed EFFECT_APPLIED transactions
+    // The FILESYSTEM_EXECUTION organ already independently verified the effect.
+    // Auto-commit all EFFECT_APPLIED transactions: effect was applied, observed, and verified.
+    try {
+      for (const [txId, tx] of currentSession.activeTransactions.entries()) {
+        if (tx.status === 'EFFECT_APPLIED') {
+          const committedTx = transactionManager.commit(tx);
+          currentSession.activeTransactions.delete(txId);
+          currentSession.completedTransactions.set(txId, committedTx);
+        }
+      }
+    } catch (reconcileErr) {
+      currentSession.transactionErrors.push(`Transaction reconciliation failed: ${reconcileErr instanceof Error ? reconcileErr.message : 'unknown'}`);
+    }
+
     // EMIT — record execution events
     const emitErrors: import('@gspl/cognitive-kernel').OrganError[] = [];
     try {
@@ -1664,6 +1808,13 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         plans: currentSession.executionPlan ? [currentSession.executionPlan as unknown as Record<string, unknown>] : [],
         events: eventStore.exportState(),
         checkpoints: checkpointData,
+        // §8: Persist complete transaction state
+        transactions: {
+          active: Array.from(currentSession.activeTransactions.entries()),
+          completed: Array.from(currentSession.completedTransactions.entries()),
+          recoveryJournals: currentSession.recoveryJournals,
+          transactionErrors: currentSession.transactionErrors,
+        },
         mutations: currentSession.genome.$lineage.mutations,
         createdAt: currentSession.startedAt,
         updatedAt: clock(),
