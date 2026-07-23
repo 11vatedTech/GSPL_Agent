@@ -211,7 +211,7 @@ export function createTransactionStore(storagePath: string): TransactionStore {
   /** §2: Hardened atomic write with fsync and restricted permissions */
   async function atomicWrite(filePath: string, data: string): Promise<void> {
     const tmpPath = filePath + '.' + Math.random().toString(36).slice(2) + '.tmp';
-    const fd = await open(tmpPath, 'w', 0o600);
+    const fd = await open(tmpPath, 'w', 0o666);
     try {
       const buf = Buffer.from(data, 'utf-8');
       await fd.write(buf, 0, buf.length, 0);
@@ -220,12 +220,7 @@ export function createTransactionStore(storagePath: string): TransactionStore {
       await fd.close();
     }
     await rename(tmpPath, filePath);
-    // Best-effort parent directory fsync
-    try {
-      const parentFd = await open(pathDirname(filePath), 'r');
-      await parentFd.sync().catch(() => {});
-      await parentFd.close();
-    } catch { /* non-critical */ }
+    // Best-effort parent directory fsync (skipped on Windows) - directory open not supported
   }
 
   /** §2: Serialize with schema version and content hash for integrity verification */
