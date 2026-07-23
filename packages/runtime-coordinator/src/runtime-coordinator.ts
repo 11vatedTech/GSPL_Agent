@@ -1546,6 +1546,51 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         const resumedTx = { ...tx, completedAt: clock() };
         resumedTx.status = resumedStatus;
         completedTransactions.set(txId, resumedTx);
+                  } else if (tx.status === 'EFFECT_STARTED') {
+        // §12: EFFECT_STARTED — effect may or may not have occurred
+        let effectDetected = false;
+        for (const op of tx.operations) {
+          if (!op.recovery) continue;
+          try {
+            await stat(op.recovery.target);
+            if (op.recovery.adapterId === 'fs-restore-modified' && op.recovery.beforeArtifactHash) {
+              const content = await readFile(op.recovery.target, 'utf-8');
+              if (sha256(content) !== op.recovery.beforeArtifactHash) effectDetected = true;
+            } else if (op.recovery.adapterId === 'fs-remove-created') {
+              effectDetected = true;
+            }
+          } catch {
+            if (op.recovery.adapterId === 'fs-restore-deleted') {
+              effectDetected = true;
+            }
+          }
+        }
+        if (effectDetected) {
+          let allRecovered = true;
+          for (const op of tx.operations) {
+            if (!op.recovery) continue;
+            try {
+              if (op.recovery.adapterId === 'fs-remove-created') {
+                await unlink(op.recovery.target).catch(function(){});
+              } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-restore-deleted') {
+                const hasContent = Object.prototype.hasOwnProperty.call(op.recovery.params, 'content');
+                if (hasContent) {
+                  await mkdir(dirname(op.recovery.target), { recursive: true });
+                  await writeFile(op.recovery.target, (op.recovery.params.content || '') as string, 'utf-8');
+                }
+              }
+            } catch { allRecovered = false; }
+          }
+          const recoveredStatus = allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const);
+          const recoveredTx = { ...tx, status: recoveredStatus, completedAt: clock() };
+          completedTransactions.set(txId, recoveredTx);
+        } else {
+          const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+          completedTransactions.set(txId, abortedTx);
+        }
+      } else if (tx.status === 'OBSERVED') {
+        // §12: OBSERVED — preserve for verification-gated commit
+        recoveredActiveTx.set(txId, tx);
       } else if (tx.status === 'PREPARED') {
         // §10: PREPARED — no effect should have occurred
         // Verify external state unchanged, then abort cleanly
@@ -1983,13 +2028,37 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               `Transaction ${txId}: rollback FAILED after verification failure`
             );
           }
-        } else {
-          // No verification organ � commit with warning (legacy compatibility)
-          const committedTx = transactionManager.commit(tx);
+        } else if (tx.status === 'EFFECT_APPLIED') {
+          const abortedTx = transactionManager.abort(tx);
           currentSession.activeTransactions.delete(txId);
-          currentSession.completedTransactions.set(txId, committedTx);
+          currentSession.completedTransactions.set(txId, abortedTx);
           currentSession.transactionErrors.push(
-            `Transaction ${txId}: committed without verification (no VERIFICATION organ)`
+            `Transaction ${txId}: ABORTED: no VERIFICATION organ for EFFECT_APPLIED`
+          );
+        } else {
+          let rolledTx = transactionManager.transition(tx, 'ROLLING_BACK');
+          await transactionStore.saveTransition(currentSession.sessionId, tx.status, rolledTx);
+          let allRecovered = true;
+          for (const op of rolledTx.operations) {
+            if (op.recovery?.adapterId && op.recovery.adapterId !== '') {
+              try {
+                const recoveryResult = await executeRecovery({
+                  adapterId: op.recovery.adapterId,
+                  target: op.recovery.target,
+                  params: op.recovery.params,
+                });
+                if (!recoveryResult.success) allRecovered = false;
+              } catch { allRecovered = false; }
+            }
+          }
+          const terminalStatus = allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const);
+          rolledTx = transactionManager.transition(rolledTx, terminalStatus);
+          rolledTx = { ...rolledTx, completedAt: clock() };
+          await transactionStore.saveTransition(currentSession.sessionId, 'ROLLING_BACK', rolledTx);
+          currentSession.activeTransactions.delete(txId);
+          currentSession.completedTransactions.set(txId, rolledTx);
+          currentSession.transactionErrors.push(
+            `Transaction ${txId}: rolled back: no VERIFICATION organ for OBSERVED`
           );
         }
       }
