@@ -61,7 +61,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
   it('Step 3: Intent compiler derives requirements with provenance', () => {
     const s = coordinator.createSession(createPrimordialGenome());
     const updated = coordinator.submitObjective(s, 'Refactor the auth module securely');
-    expect(updated.compiledIntent!.requirements.length).toBeGreaterThan(0);
+    expect(updated.compiledIntent!.requirements.length).toBeGreaterThanOrEqual(1);
     expect(updated.compiledIntent!.requirements[0].status).toBe('derived');
   });
 
@@ -74,7 +74,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
     const s = coordinator.createSession(createPrimordialGenome());
     const intent = coordinator.submitObjective(s, 'Analyze code for security vulnerabilities');
     const ticked = await coordinator.executeTick(intent);
-    expect(ticked.cognitiveGraph!.organs.length).toBeGreaterThan(0);
+    expect(ticked.cognitiveGraph!.organs.length).toBeGreaterThanOrEqual(1);
   });
 
   it('Step 7: Different objectives produce structurally different phenotypes', async () => {
@@ -96,7 +96,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
     const s = coordinator.createSession(createPrimordialGenome());
     const ticked = await coordinator.executeTick(coordinator.submitObjective(s, 'List files'));
     expect(ticked.phase).toBe('PERSIST');
-    expect(ticked.tick).toBeGreaterThan(s.tick);
+    expect(ticked.tick).toBeGreaterThanOrEqual(s.tick + 1);
   });
 
   it('Step 14-15: Epistemic engine creates and tracks claims', async () => {
@@ -111,6 +111,7 @@ describe('GSPL Agent — End-to-End Reference Scenario', () => {
     const v = await coordinator.verifyCompletion(ticked);
     expect(v.complete).toBeDefined();
     expect(v.confidence).toBeGreaterThanOrEqual(0);
+    expect(v.confidence).toBeLessThanOrEqual(1);
   });
 
   it('Step 18-20: Checkpoint and restore lifecycle', async () => {

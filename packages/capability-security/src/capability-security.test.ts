@@ -58,7 +58,7 @@ describe('Capability Security', () => {
     // Grant a capability first
     cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority' });
     const result = cm.check('FILESYSTEM_READ', { path: './src' });
-    expect(result.reason.length).toBeGreaterThan(0);
+    expect(result.reason.length).toBeGreaterThanOrEqual(1);
   });
 
   it('different policy = different capabilities', () => {

@@ -106,7 +106,7 @@ describe('Persistence Layer (REAL)', () => {
     const state = makeState('agent-export');
     const exported = await persistence.exportState(state);
     expect(exported).toBeInstanceOf(Uint8Array);
-    expect(exported.length).toBeGreaterThan(0);
+    expect(exported.length).toBeGreaterThanOrEqual(1);
   });
 
   it('migrates schema versions', () => {

@@ -10,12 +10,12 @@ describe('Intent Compiler', () => {
   it('extracts goal from natural language', () => {
     const result = compileIntent('Refactor the authentication module to use JWT');
     expect(result.intent.goal).toBeDefined();
-    expect(result.intent.goal.length).toBeGreaterThan(0);
+    expect(result.intent.goal.length).toBeGreaterThanOrEqual(1);
   });
 
   it('derives requirements from stated goal', () => {
     const result = compileIntent('Build a REST API for user management');
-    expect(result.requirements.length).toBeGreaterThan(0);
+    expect(result.requirements.length).toBeGreaterThanOrEqual(1);
   });
 
   it('each derived requirement has description and sourceIntent', () => {
@@ -28,12 +28,12 @@ describe('Intent Compiler', () => {
 
   it('identifies constraints from input', () => {
     const result = compileIntent('Optimize database queries without changing the schema securely');
-    expect(result.intent.constraints.length).toBeGreaterThan(0);
+    expect(result.intent.constraints.length).toBeGreaterThanOrEqual(1);
   });
 
   it('identifies anti-goals when specified', () => {
     const result = compileIntent('Improve performance but do not increase memory usage');
-    expect(result.intent.antiGoals.length).toBeGreaterThan(0);
+    expect(result.intent.antiGoals.length).toBeGreaterThanOrEqual(1);
   });
 
   it('authority is not silently expanded', () => {

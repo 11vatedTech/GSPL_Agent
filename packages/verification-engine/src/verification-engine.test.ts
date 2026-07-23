@@ -17,7 +17,7 @@ describe('Verification Engine', () => {
   it('detects requirement failure', () => {
     const result = ve.verifyRequirement('REQ-2', 'expected', 'actual');
     expect(result.passed).toBe(false);
-    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
   });
 
   it('verifies artifact existence (async)', async () => {
@@ -53,7 +53,7 @@ describe('Verification Engine', () => {
   it('reports test failures correctly', () => {
     const result = ve.verifyTestSuite(() => ({ passed: 3, failed: 2, errors: ['test_b failed'] }));
     expect(result.passed).toBe(false);
-    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
   });
 
   it('verifies security policy', () => {
@@ -65,7 +65,7 @@ describe('Verification Engine', () => {
   it('security policy without invariants fails', () => {
     const result = ve.verifySecurityPolicy({});
     // Should detect missing invariants
-    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.length).toBeGreaterThanOrEqual(1);
   });
 
   it('verifies provenance', () => {
@@ -90,6 +90,7 @@ describe('Verification Engine', () => {
     const agg = ve.aggregateResults([r1, r2]);
     expect(agg.passed).toBe(true);
     expect(agg.confidence).toBeGreaterThan(0);
+    expect(agg.confidence).toBeLessThanOrEqual(1);
   });
 
   it('aggregation detects any failure', () => {

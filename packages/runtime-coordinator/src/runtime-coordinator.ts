@@ -73,6 +73,18 @@ const DEFAULT_RUNTIME_CONFIG: RuntimeConfig = {
   maxMemoryBytes: 16 * 1024 * 1024 * 1024,
 };
 
+// §15: Failure-injection hooks for testing crash recovery boundaries
+export interface TransactionFailureHooks {
+  afterPreparedPersist?(): Promise<void>;
+  afterAuthorizedPersist?(): Promise<void>;
+  afterEffectStartedPersist?(): Promise<void>;
+  afterAdapterEffect?(): Promise<void>;
+  afterObservationPersist?(): Promise<void>;
+  afterValidationPersist?(): Promise<void>;
+  duringRollback?(): Promise<void>;
+  afterRecoveryEffect?(): Promise<void>;
+}
+
 // ── Dependencies ──
 
 export interface RuntimeDependencies {
@@ -87,6 +99,8 @@ export interface RuntimeDependencies {
   transactionManager: TransactionManager;
   /** §1: Durable transaction store — persists every transition before the next side effect */
   transactionStore: TransactionStore;
+  /** §15: Failure-injection hooks for testing crash recovery boundaries */
+  transactionFailureHooks?: TransactionFailureHooks;
   clock: () => number;
   generateId: (prefix?: string) => string;
   config: RuntimeConfig;
@@ -236,6 +250,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   const actionExecutor: ActionExecutor = deps.actionExecutor ?? createActionExecutor(actionRegistry);
   const transactionManager: TransactionManager = deps.transactionManager ?? createTransactionManager();
   const transactionStore: TransactionStore = deps.transactionStore;
+  const transactionFailureHooks: TransactionFailureHooks | undefined = (deps as any).transactionFailureHooks;
   const clock: () => number = deps.clock ?? (() => Date.now());
   const generateId: (prefix?: string) => string = deps.generateId ??
     ((p) => (p ?? 'gid') + '-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
@@ -714,6 +729,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         });
         // §3: Persist PREPARED before any side effect
         await transactionStore.savePrepared(session.sessionId, tx);
+        await transactionFailureHooks?.afterPreparedPersist?.();
         session.activeTransactions.set(tx.id, tx);
         session.currentTransactionId = tx.id;
 
@@ -776,6 +792,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           // §4: Durable AUTHORIZED transition BEFORE external effect
           tx = transactionManager.transition(tx, 'AUTHORIZED');
           await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
+          await transactionFailureHooks?.afterAuthorizedPersist?.();
           session.activeTransactions.set(tx.id, tx);
         }
 
@@ -783,19 +800,14 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (!hasAuthState) {
           tx = transactionManager.transition(tx, 'AUTHORIZED');
           await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
-          session.activeTransactions.set(tx.id, tx);
-        }
-
-        // If we skipped the AUTHORIZED transition above (no preflight auth state), do it now
-        if (!hasAuthState) {
-          tx = transactionManager.transition(tx, 'AUTHORIZED');
-          await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
+          await transactionFailureHooks?.afterAuthorizedPersist?.();
           session.activeTransactions.set(tx.id, tx);
         }
 
         // §4: Transition to EFFECT_STARTED before adapter invocation
         tx = transactionManager.transition(tx, 'EFFECT_STARTED');
         await transactionStore.saveTransition(session.sessionId, 'AUTHORIZED', tx);
+        await transactionFailureHooks?.afterEffectStartedPersist?.();
         session.activeTransactions.set(tx.id, tx);
 
         const result = await actionExecutor.execute(actionId, params, authCtx, session.capabilityManager);
@@ -806,12 +818,50 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         // §17: Update transaction after-state but do NOT commit
         // Commit happens after observation + verification in the coordinator
         if (result.success) {
+          await transactionFailureHooks?.afterAdapterEffect?.();
           tx = { ...tx, operations: tx.operations.map(op => ({
             ...op,
             after: op.target === ((result.artifacts[0] as any)?.path ?? '') ? { hash: (result.artifacts[0] as any)?.hash, sizeBytes: (result.artifacts[0] as any)?.sizeBytes } : op.after,
           })) };
+          // §5: Create TransactionObservation from filesystem state
+          const targetPath = (params as any)?.path as string | undefined;
+          let afterHash: string | null = null;
+          let afterSize: number | null = null;
+          try {
+            if (targetPath) {
+              const fileStat = await stat(targetPath);
+              const fileContent = await readFile(targetPath, 'utf-8');
+              afterHash = sha256(fileContent);
+              afterSize = fileStat.size;
+            }
+          } catch { /* file may not exist yet */ }
+          tx = {
+            ...tx,
+            observations: [...tx.observations, {
+              id: 'obs-' + tx.id + '-' + node.id,
+              transactionId: tx.id,
+              operationId: 'op-' + node.id,
+              operationType: node.rollback === 'fs-remove-created' ? 'create' as const
+                : node.rollback === 'fs-restore-modified' ? 'modify' as const
+                : node.rollback === 'fs-restore-deleted' ? 'delete' as const
+                : 'modify' as const,
+              target: targetPath ?? '',
+              beforeExists: !!beforeContent,
+              beforeHash: beforeHash ?? null,
+              beforeSize: null,
+              afterExists: afterHash !== null,
+              afterHash,
+              afterSize,
+              expectedExists: null,
+              expectedHash: node.expectedHash ?? null,
+              classification: afterHash !== null ? 'EXPECTED_EFFECT' as const : 'NO_EFFECT' as const,
+              observedAt: clock(),
+              errors: [],
+            }],
+          };
           tx = transactionManager.transition(tx, 'EFFECT_APPLIED');
           await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
+          await transactionFailureHooks?.afterObservationPersist?.();
         } else {
           // §9: Filesystem-based effect detection (not error-code heuristics)
           const targetPath = (params as any)?.path as string | undefined;
@@ -841,6 +891,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             session.completedTransactions.set(tx.id, tx);
           } else {
           // §8: Transition to ROLLING_BACK and execute recovery adapters
+          await transactionFailureHooks?.duringRollback?.();
           tx = transactionManager.transition(tx, 'ROLLING_BACK');
           await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
           let allRecovered = true;
@@ -882,6 +933,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           tx = transactionManager.transition(tx, terminalStatus);
           tx = { ...tx, completedAt: clock() };
           await transactionStore.saveTransition(session.sessionId, 'ROLLING_BACK', tx);
+          await transactionFailureHooks?.afterRecoveryEffect?.();
           session.recoveryJournals.push(...tx.operations.filter(o => o.recovery).map(o => ({ operationId: o.id, recovery: o.recovery!, timestamp: clock(), status: allRecovered ? ('executed' as const) : ('failed' as const) })));
           } // close inner else (recovery branch)
         } // close outer else (failure branch)

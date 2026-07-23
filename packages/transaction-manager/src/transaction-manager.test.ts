@@ -100,7 +100,7 @@ describe('Transaction Manager', () => {
     const rolled = await tm.rollback(withOp);
     // Irreversible operations cannot be rolled back — truthful behavior
     expect(rolled.status === 'ROLLBACK_FAILED' || rolled.status === 'PARTIALLY_ROLLED_BACK').toBe(true);
-    expect(rolled.recoveryErrors.length).toBeGreaterThan(0);
+    expect(rolled.recoveryErrors.length).toBeGreaterThanOrEqual(1);
   });
 
   it('executes restore callback on rollback', async () => {
@@ -131,7 +131,7 @@ describe('Transaction Manager', () => {
       restore: async () => { throw new Error('disk failure'); },
     });
     const rolled = await tm.rollback(withOp);
-    expect(rolled.recoveryErrors.length).toBeGreaterThan(0);
+    expect(rolled.recoveryErrors.length).toBeGreaterThanOrEqual(1);
     expect(rolled.status).toBe('ROLLBACK_FAILED');
   });
 });

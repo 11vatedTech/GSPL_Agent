@@ -70,7 +70,7 @@ describe('Agent Genes — Registry', () => {
   it('Registry lists all types', () => {
     const r = createStandardCognitiveRegistry();
     const types = r.list();
-    expect(types.length).toBeGreaterThan(0);
+    expect(types.length).toBeGreaterThanOrEqual(1);
   });
 });
 

@@ -52,13 +52,13 @@ describe('Cognitive Morphogenesis', () => {
     const start = Date.now();
     const result = performMorphogenesis({ ...makeReq('Complex analysis', MOCK_INTENT), resourceBudget: { maxComputeUnits: 1000, maxMemoryBytes: 1e8, maxWallTimeMs: 5000, maxTokens: 100000 } });
     expect(Date.now() - start).toBeLessThan(5000);
-    expect(result.cognitiveGraph.organs.length).toBeGreaterThan(0);
+    expect(result.cognitiveGraph.organs.length).toBeGreaterThanOrEqual(1);
   });
 
   it('MORPH-4: Generated cognitive graph is a valid DAG', () => {
     const result = performMorphogenesis(makeReq('Analyze project', MOCK_INTENT));
     const g = result.cognitiveGraph;
-    expect(g.organs.length).toBeGreaterThan(0);
+    expect(g.organs.length).toBeGreaterThanOrEqual(1);
     expect(g.rootOrganId).toBeDefined();
     for (const e of g.edges) expect(e.from).not.toBe(e.to);
     const ids = new Set(g.organs.map(o => o.id));
@@ -67,7 +67,7 @@ describe('Cognitive Morphogenesis', () => {
 
   it('MORPH-5: Records reasoning, rejected alternatives, assumptions', () => {
     const result = performMorphogenesis(makeReq('Build complex system', MOCK_INTENT));
-    expect(result.reasoning.length).toBeGreaterThan(0);
+    expect(result.reasoning.length).toBeGreaterThanOrEqual(1);
     expect(Array.isArray(result.rejectedAlternatives)).toBe(true);
     expect(Array.isArray(result.assumptions)).toBe(true);
   });
