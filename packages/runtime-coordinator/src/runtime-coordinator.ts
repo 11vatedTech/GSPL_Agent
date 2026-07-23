@@ -80,7 +80,6 @@ export interface TransactionFailureHooks {
   afterEffectStartedPersist?(): Promise<void>;
   afterAdapterEffect?(): Promise<void>;
   afterObservationPersist?(): Promise<void>;
-  afterValidationPersist?(): Promise<void>;
   duringRollback?(): Promise<void>;
   afterRecoveryEffect?(): Promise<void>;
 }
