@@ -89,6 +89,7 @@ export interface TransactionFailureHooks {
 export interface RuntimeDependencies {
   /** §1: External authority provider — required trust boundary for capability issuance */
   authorityProvider: AuthorityProvider;
+  /** §9: Trusted authority verifier — validates provider identity and decision proofs */
   persistence: PersistenceLayer;
   eventStore: EventStore;
   observability: ObservabilitySystem;
@@ -210,6 +211,7 @@ export function createTestRuntimeCoordinator(overrides?: Partial<RuntimeDependen
   registerStandardActions(baseRegistry);
   return createRuntimeCoordinator({
     authorityProvider: createTestAuthorityProvider(baseGenerateId),
+    authorityVerifier: createTestAuthorityVerifier(baseGenerateId('test-auth')),
     persistence: createPersistenceLayer({ storagePath: join(tmpdir(), 'gspl-test-state-' + baseGenerateId('persist')), schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, compressionEnabled: false }),
     eventStore: createEventStore(),
     observability: createObservabilitySystem(),
@@ -255,6 +257,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     ((p) => (p ?? 'gid') + '-' + clock().toString(36) + '-' + Math.random().toString(36).slice(2, 10));
   // §1: Authority provider — required trust boundary
   const authorityProvider: AuthorityProvider = deps.authorityProvider;
+  // §9: Authority verifier — validates provider identity and proofs
   const planExecutor = createPlanExecutor();
 
   registerStandardActions(actionRegistry);
@@ -1577,6 +1580,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (effectType === 'COMPLETE') {
           // Complete effect — promote to EFFECT_APPLIED for verification-gated commit
           const promotedTx = { ...tx, status: 'EFFECT_APPLIED' as const };
+          await transactionStore.saveTransition(session.sessionId, tx.status, promotedTx);
           recoveredActiveTx.set(txId, promotedTx);
         } else if (effectType === 'PARTIAL') {
           // Partial/unexpected effect — recover
@@ -1597,10 +1601,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           const recoveredStatus = allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const);
           const recoveredTx = { ...tx, status: recoveredStatus, completedAt: clock() };
+          await transactionStore.saveTransition(session.sessionId, tx.status, recoveredTx);
           completedTransactions.set(txId, recoveredTx);
         } else {
           // No effect — abort cleanly
           const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
+          await transactionStore.saveTransition(session.sessionId, tx.status, abortedTx);
           completedTransactions.set(txId, abortedTx);
         }
       } else if (tx.status === 'OBSERVED') {

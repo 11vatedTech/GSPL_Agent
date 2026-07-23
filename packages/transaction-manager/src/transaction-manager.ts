@@ -296,8 +296,17 @@ export function createTransactionStore(storagePath: string): TransactionStore {
           'ROLLED_BACK', 'PARTIALLY_ROLLED_BACK', 'ROLLBACK_FAILED',
           'COMPENSATING', 'COMPENSATED', 'PARTIALLY_COMPENSATED', 'COMPENSATION_FAILED', 'ABORTED'
         ];
+        const knownOperationTypes = ['create', 'modify', 'delete', 'read', 'write'];
+        const knownRecoveryAdapters = ['fs-remove-created', 'fs-restore-modified', 'fs-restore-deleted', ''];
         for (const tx of allTxns) {
           if (!knownStatuses.includes(tx.status)) return null;
+          // Validate operation types
+          if (tx.operations) {
+            for (const op of tx.operations) {
+              if (op.type && !knownOperationTypes.includes(op.type)) return null;
+              if (op.recovery?.adapterId && !knownRecoveryAdapters.includes(op.recovery.adapterId)) return null;
+            }
+          }
           // Check for duplicate IDs
           const sameId = allTxns.filter(t => t.id === tx.id);
           if (sameId.length > 1) return null;
