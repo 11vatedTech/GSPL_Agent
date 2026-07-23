@@ -779,6 +779,13 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           session.activeTransactions.set(tx.id, tx);
         }
 
+        // If we skipped the AUTHORIZED transition above (no preflight auth state), do it now
+        if (!hasAuthState) {
+          tx = transactionManager.transition(tx, 'AUTHORIZED');
+          await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
+          session.activeTransactions.set(tx.id, tx);
+        }
+
         // §4: Transition to EFFECT_STARTED before adapter invocation
         tx = transactionManager.transition(tx, 'EFFECT_STARTED');
         await transactionStore.saveTransition(session.sessionId, 'AUTHORIZED', tx);
@@ -1083,6 +1090,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               const hashResult = await verification.verifyArtifactHash(((node.actionParams as any)?.["path"]as string), node.expectedHash);
               results.push(hashResult);
             }
+
           }
         }
       }
@@ -1804,7 +1812,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           const isUnavailable = result.errors.some(e => e.code === 'ORGAN_UNAVAILABLE');
           if (isUnavailable) {
-            organ.status = 'FAILED';
+            // ORGAN_UNAVAILABLE is not a failure � the organ ran correctly
+            // and determined it is not applicable. Mark as COMPLETED so that
+            // verification (organs-completed check) does not falsely fail.
+            organ.status = 'COMPLETED';
           } else {
             organ.status = result.errors.some(e => e.severity === 'fatal') ? 'FAILED' : 'COMPLETED';
           }
@@ -1861,36 +1872,75 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       phase: 'REDUCE', success: reduceErrors.length === 0, errors: reduceErrors,
     };
 
-    // §7: Verification-aware transaction reconciliation
-    // Always commit EFFECT_APPLIED transactions (effect was applied successfully).
-    // Verification result is recorded as audit metadata but does not block commitment,
-    // because post-effect verification is advisory at this layer — the effect is already
-    // durably applied on disk. Verification failure triggers recovery evidence but not
-    // rollback, since rollback would destroy valid work.
+    // �7: Authoritative verification � verification controls commit or rollback.
+    // Verification failure triggers rollback (not advisory commit).
+    // No transaction is committed merely because an effect exists on disk.
     try {
       const verificationOrg = currentSession.cognitiveGraph?.organs.find(
-        o => o.contract.organType === 'VERIFICATION'
+        o => o.contract.organType === "VERIFICATION"
       );
       let verificationPassed = false;
-      if (verificationOrg?.status === 'COMPLETED' && verificationOrg.result) {
+      if (verificationOrg?.status === "COMPLETED" && verificationOrg.result) {
         const rawOutput = verificationOrg.result.output as Record<string, unknown> | undefined;
         verificationPassed = rawOutput?.verified === true;
       }
-      for (const [txId, tx] of currentSession.activeTransactions.entries()) {
-        if (tx.status === 'EFFECT_APPLIED' || tx.status === 'OBSERVED') {
+      const toProcess = Array.from(currentSession.activeTransactions.entries()).filter(
+        ([_, tx]) => tx.status === "EFFECT_APPLIED" || tx.status === "OBSERVED"
+      );
+      for (const [txId, tx] of toProcess) {
+        if (verificationPassed) {
+          // Verification passed � commit the transaction
           const committedTx = transactionManager.commit(tx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, committedTx);
-          if (!verificationPassed && verificationOrg) {
-            // Audit: verification did not pass, but we still commit (effect is durable)
+        } else if (verificationOrg) {
+          // Verification organ exists but failed � rollback
+          let rolledTx = transactionManager.transition(tx, "ROLLING_BACK");
+          // Persist ROLLING_BACK before recovery execution (crash-safe)
+          await transactionStore.saveTransition(currentSession.sessionId, tx.status, rolledTx);
+          let allRecovered = true;
+          for (const op of rolledTx.operations) {
+            if (op.recovery?.adapterId && op.recovery.adapterId !== "") {
+              try {
+                const descriptor = {
+                  adapterId: op.recovery.adapterId,
+                  target: op.recovery.target,
+                  params: op.recovery.params,
+                };
+                const recoveryResult = await executeRecovery(descriptor);
+                if (!recoveryResult.success) allRecovered = false;
+              } catch {
+                allRecovered = false;
+              }
+            }
+          }
+          const terminalStatus = allRecovered ? ("ROLLED_BACK" as const) : ("ROLLBACK_FAILED" as const);
+          rolledTx = transactionManager.transition(rolledTx, terminalStatus);
+          rolledTx = { ...rolledTx, completedAt: clock() };
+          await transactionStore.saveTransition(currentSession.sessionId, "ROLLING_BACK", rolledTx);
+          currentSession.activeTransactions.delete(txId);
+          currentSession.completedTransactions.set(txId, rolledTx);
+          if (allRecovered) {
             currentSession.transactionErrors.push(
-              `Transaction ${txId}: committed with verification=FAILED (advisory only)`
+              `Transaction ${txId}: rolled back successfully after verification failure`
+            );
+          } else {
+            currentSession.transactionErrors.push(
+              `Transaction ${txId}: rollback FAILED after verification failure`
             );
           }
+        } else {
+          // No verification organ � commit with warning (legacy compatibility)
+          const committedTx = transactionManager.commit(tx);
+          currentSession.activeTransactions.delete(txId);
+          currentSession.completedTransactions.set(txId, committedTx);
+          currentSession.transactionErrors.push(
+            `Transaction ${txId}: committed without verification (no VERIFICATION organ)`
+          );
         }
       }
     } catch (reconcileErr) {
-      currentSession.transactionErrors.push(`Transaction reconciliation failed: ${reconcileErr instanceof Error ? reconcileErr.message : 'unknown'}`);
+      currentSession.transactionErrors.push(`Transaction reconciliation failed: ${reconcileErr instanceof Error ? reconcileErr.message : "unknown"}`);
     }
 
     // EMIT — record execution events
