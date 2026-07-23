@@ -1547,25 +1547,39 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         resumedTx.status = resumedStatus;
         completedTransactions.set(txId, resumedTx);
                   } else if (tx.status === 'EFFECT_STARTED') {
-        // §12: EFFECT_STARTED — effect may or may not have occurred
-        let effectDetected = false;
+        // §12: EFFECT_STARTED — inspect external state for effect classification
+        let effectType: 'NONE' | 'COMPLETE' | 'PARTIAL' = 'NONE';
         for (const op of tx.operations) {
           if (!op.recovery) continue;
           try {
             await stat(op.recovery.target);
-            if (op.recovery.adapterId === 'fs-restore-modified' && op.recovery.beforeArtifactHash) {
+            // File exists — check operation type
+            if (op.recovery.adapterId === 'fs-remove-created') {
+              // Create: file exists = complete successful effect
+              effectType = 'COMPLETE';
+            } else if (op.recovery.adapterId === 'fs-restore-modified' && op.recovery.beforeArtifactHash) {
+              // Modify: file content differs from before = effect occurred
               const content = await readFile(op.recovery.target, 'utf-8');
-              if (sha256(content) !== op.recovery.beforeArtifactHash) effectDetected = true;
-            } else if (op.recovery.adapterId === 'fs-remove-created') {
-              effectDetected = true;
+              if (sha256(content) !== op.recovery.beforeArtifactHash) {
+                effectType = 'PARTIAL'; // Can't verify completeness without expected hash
+              }
             }
           } catch {
             if (op.recovery.adapterId === 'fs-restore-deleted') {
-              effectDetected = true;
+              // Delete: file absent = complete successful effect
+              effectType = 'COMPLETE';
+            } else if (op.recovery.adapterId === 'fs-restore-modified' || op.recovery.adapterId === 'fs-remove-created') {
+              // Create or modify: file unexpectedly missing = partial effect
+              effectType = 'PARTIAL';
             }
           }
         }
-        if (effectDetected) {
+        if (effectType === 'COMPLETE') {
+          // Complete effect — promote to EFFECT_APPLIED for verification-gated commit
+          const promotedTx = { ...tx, status: 'EFFECT_APPLIED' as const };
+          recoveredActiveTx.set(txId, promotedTx);
+        } else if (effectType === 'PARTIAL') {
+          // Partial/unexpected effect — recover
           let allRecovered = true;
           for (const op of tx.operations) {
             if (!op.recovery) continue;
@@ -1585,6 +1599,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           const recoveredTx = { ...tx, status: recoveredStatus, completedAt: clock() };
           completedTransactions.set(txId, recoveredTx);
         } else {
+          // No effect — abort cleanly
           const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
           completedTransactions.set(txId, abortedTx);
         }
@@ -2030,6 +2045,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
         } else if (tx.status === 'EFFECT_APPLIED') {
           const abortedTx = transactionManager.abort(tx);
+          // Persist the abort state for crash consistency
+          await transactionStore.saveTransition(currentSession.sessionId, tx.status, abortedTx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, abortedTx);
           currentSession.transactionErrors.push(
