@@ -1496,12 +1496,33 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         providerId: string; grantedAt: number;
       }>;
     } | undefined;
-    const activeTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
-      txData?.active ?? []
-    );
-    const completedTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
-      txData?.completed ?? []
-    );
+    // §6: Reconcile durable transaction store with session snapshot
+    // Transaction-store state newer than session state wins for transaction lifecycle
+    let activeTransactions: Map<string, import('@gspl/transaction-manager').Transaction>;
+    let completedTransactions: Map<string, import('@gspl/transaction-manager').Transaction>;
+    if (durableTransactions) {
+      // §6: Durable store is source of truth — use its state
+      activeTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+        durableTransactions.active?.map((t: any) => [t.id, t]) ?? []
+      );
+      completedTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+        durableTransactions.completed?.map((t: any) => [t.id, t]) ?? []
+      );
+      // Merge session snapshot entries not in durable store (snapshot may have newer data)
+      for (const [id, stx] of new Map(txData?.active ?? [])) {
+        if (!activeTransactions.has(id) && !completedTransactions.has(id)) {
+          activeTransactions.set(id, stx);
+        }
+      }
+    } else {
+      // No durable store — fall back to session snapshot
+      activeTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+        txData?.active ?? []
+      );
+      completedTransactions = new Map<string, import('@gspl/transaction-manager').Transaction>(
+        txData?.completed ?? []
+      );
+    }
     const recoveryJournals = txData?.recoveryJournals ?? [];
     const transactionErrors = txData?.transactionErrors ?? [];
 
