@@ -1433,61 +1433,15 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     const durableTransactions = durableLoadResult.kind === 'LOADED' ? durableLoadResult.state : null;
     // §4-6: CORRUPTED and IO_ERROR journals MUST fail closed
     if (durableLoadResult.kind === 'CORRUPTED') {
-      recoveredTxErrors.push('FATAL: Transaction journal is corrupted, refusing to restore session');
-      recoveredTxErrors.push(...durableLoadResult.errors.map(e => `Corruption detail: ${e.code} — ${e.message}`));
-      sessionErrors.push({
-        code: 'TRANSACTION_JOURNAL_CORRUPTED',
-        message: `Transaction journal for agent ${agentId} is corrupted with ${durableLoadResult.errors.length} integrity errors`,
-        severity: 'FATAL',
-        timestamp: clock(),
-        source: 'restoreSession',
-      });
-      // §10: Merge and return all recovery errors
-      const mergedErrors = [...(txData?.transactionErrors ?? []), ...recoveredTxErrors];
-      return {
-        ...state,
-        agentId,
-        errors: [...coreErrors, ...sessionErrors, ...mergedErrors],
-        activeTransactions: new Map(),
-        completedTransactions: new Map(),
-        authorizationStates: new Map(),
-        authorityDecisions: new Map(),
-        approvalEvidence: new Map(),
-        recoveryJournals: [],
-        currentTransactionId: null,
-        transactionErrors: mergedErrors,
-        restoredWithErrors: true,
-      };
-    }
-    
-    // §5: IO_ERROR must fail closed — never treat as absence
-    if (durableLoadResult.kind === 'IO_ERROR') {
+      recoveredTxErrors.push('FATAL: Transaction journal is corrupted');
+      recoveredTxErrors.push(...durableLoadResult.errors.map(e => `Corruption: ${e.code} — ${e.message}`));
+      // §4: Fail closed — throw to prevent any snapshot fallback
+      throw new Error(`Transaction journal for agent ${agentId} is corrupted with ${durableLoadResult.errors.length} integrity errors: ${durableLoadResult.errors.map(e => e.code).join(', ')}`);
+    } else if (durableLoadResult.kind === 'IO_ERROR') {
       recoveredTxErrors.push(`FATAL: Transaction journal I/O error: ${durableLoadResult.error.code} — ${durableLoadResult.error.message}`);
-      sessionErrors.push({
-        code: 'TRANSACTION_JOURNAL_IO_ERROR',
-        message: `Cannot read transaction journal for agent ${agentId}: ${durableLoadResult.error.message}`,
-        severity: 'FATAL',
-        timestamp: clock(),
-        source: 'restoreSession',
-      });
-      const mergedErrors = [...(txData?.transactionErrors ?? []), ...recoveredTxErrors];
-      return {
-        ...state,
-        agentId,
-        errors: [...coreErrors, ...sessionErrors, ...mergedErrors],
-        activeTransactions: new Map(),
-        completedTransactions: new Map(),
-        authorizationStates: new Map(),
-        authorityDecisions: new Map(),
-        approvalEvidence: new Map(),
-        recoveryJournals: [],
-        currentTransactionId: null,
-        transactionErrors: mergedErrors,
-        restoredWithErrors: true,
-      };
+      // §5: Fail closed — never treat I/O errors as absence
+      throw new Error(`Cannot read transaction journal for agent ${agentId}: ${durableLoadResult.error.message}`);
     }
-    
-    const txJournalErrors: TransactionIntegrityError[] = [];
 
     const state = await persistence.load(agentId);
     if (!state) {

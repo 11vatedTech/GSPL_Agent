@@ -323,8 +323,10 @@ export function createTransactionStore(storagePath: string): TransactionStore {
         errors.push({ code: 'SCHEMA_VERSION_MISMATCH', message: `Unknown schema version: ${parsed.schemaVersion}`, detail: String(parsed.schemaVersion) });
       }
 
-      // Verify content hash
-      if (parsed.contentHash) {
+      // §6: Content hash is mandatory — reject journals without it
+      if (!parsed.contentHash) {
+        errors.push({ code: 'HASH_MISMATCH', message: 'Transaction journal is missing mandatory content hash — rejected' });
+      } else {
         const { contentHash: storedHash, ...rest } = parsed;
         const recomputed = sha256(JSON.stringify(rest));
         if (storedHash !== recomputed) {

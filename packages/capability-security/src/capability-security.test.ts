@@ -42,7 +42,7 @@ describe('Capability Security', () => {
 
   it('delegation cannot exceed parent authority', () => {
     // Grant a capability first, then check
-    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority' });
+    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority', parameterHash: 'test-hash' });
     const pScope: CapabilityScope = { path: './src' };
     const cScope: CapabilityScope = { path: './src', toolName: 'child' };
     expect(cm.check('FILESYSTEM_READ', pScope).authorized).toBe(cm.check('FILESYSTEM_READ', cScope).authorized);
@@ -56,7 +56,7 @@ describe('Capability Security', () => {
 
   it('known effect types are checked against rules', () => {
     // Grant a capability first
-    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority' });
+    cm.grant({ name: 'test', effectType: 'FILESYSTEM_READ', scope: { path: './src' }, authority: 'OWNER', requestedBy: 'owner-authority', parameterHash: 'test-hash' });
     const result = cm.check('FILESYSTEM_READ', { path: './src' });
     expect(result.reason.length).toBeGreaterThanOrEqual(1);
   });
@@ -69,8 +69,8 @@ describe('Capability Security', () => {
     expect(cm1.check('FILESYSTEM_DELETE', {}).authorized).toBe(false);
     expect(cm2.check('FILESYSTEM_DELETE', {}).authorized).toBe(false);
     // When a capability IS granted, both policies allow it (cm1 has matching rule, cm2 has default ALLOW)
-    cm1.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority' });
-    cm2.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority' });
+    cm1.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority', parameterHash: 'test-hash' });
+    cm2.grant({ name: 'test', effectType: 'FILESYSTEM_DELETE', scope: {}, authority: 'OWNER', requestedBy: 'owner-authority', parameterHash: 'test-hash' });
     expect(cm1.check('FILESYSTEM_DELETE', {}).authorized).toBe(true);
     expect(cm2.check('FILESYSTEM_DELETE', {}).authorized).toBe(true);
   });
