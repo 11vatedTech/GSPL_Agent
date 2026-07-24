@@ -535,6 +535,19 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       if (capabilities.has(cap.id)) {
         return { accepted: false, capabilityId: cap.id, reason: `Duplicate capability ID: ${cap.id}` };
       }
+      // §1-2: Set complete binding from the validated envelope (provider may send incomplete binding)
+      cap.binding = {
+        principalId: envelope.principalId,
+        sessionId: envelope.sessionId,
+        intentId: envelope.intentId,
+        planId: envelope.planId,
+        planNodeId: envelope.planNodeId,
+        actionId: envelope.actionId,
+        effectType: envelope.effectType,
+        canonicalTarget: envelope.canonicalTarget,
+        canonicalParameterHash: envelope.canonicalParameterHash,
+      };
+      cap.parameterHash = envelope.canonicalParameterHash;
       // Import the capability with issuance evidence
       cap.issuanceEvidence = {
         issuer: decision.providerId,
@@ -737,16 +750,29 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       if (context.canonicalParameterHash && cap.parameterHash && context.canonicalParameterHash !== cap.parameterHash) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PARAMETER_MISMATCH', reason: `Parameter hash mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      // §3: Validate canonical target
-      if (context.canonicalTarget && cap.binding?.canonicalTarget && context.canonicalTarget !== cap.binding.canonicalTarget) {
+      // §3: Fail-closed — missing parameter hash or binding denies (never silently skips)
+      if (!cap.parameterHash) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'MISSING', reason: 'Capability missing parameter hash binding', requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      // §3: Validate canonical target — missing binding denies
+      if (!cap.binding) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'MISSING', reason: 'Capability missing binding — required for exact authorization', requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if (cap.binding.canonicalTarget !== context.canonicalTarget) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'TARGET_MISMATCH', reason: `Target mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      // §3: Validate issuance request hash
-      if (context.issuanceRequestHash && cap.issuanceEvidence && (cap.issuanceEvidence as any).requestHash !== context.issuanceRequestHash) {
+      // §3: Fail-closed — missing issuance evidence or request hash denies
+      if (!cap.issuanceEvidence || !(cap.issuanceEvidence as any).requestHash) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'MISSING', reason: 'Capability missing issuance evidence', requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if ((cap.issuanceEvidence as any).requestHash !== context.issuanceRequestHash) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'INVALID_ISSUER', reason: `Issuance request hash mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
-      // §3: Validate provider identity
-      if (context.providerId && cap.issuanceEvidence && (cap.issuanceEvidence as any).issuer !== context.providerId) {
+      // §3: Fail-closed — missing provider identity denies
+      if (!(cap.issuanceEvidence as any).issuer) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'MISSING', reason: 'Capability missing provider identity', requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      if ((cap.issuanceEvidence as any).issuer !== context.providerId) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PROVIDER_MISMATCH', reason: `Provider mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
 
