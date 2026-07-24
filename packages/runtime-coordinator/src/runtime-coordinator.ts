@@ -866,7 +866,13 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
               afterSize,
               expectedExists: null,
               expectedHash: node.expectedHash ?? null,
-              classification: afterHash !== null ? 'EXPECTED_EFFECT' as const : 'NO_EFFECT' as const,
+              classification: node.rollback === 'fs-remove-created'
+                ? (afterHash !== null && (!node.expectedHash || afterHash === node.expectedHash) ? 'EXPECTED_EFFECT' as const : 'UNEXPECTED_EFFECT' as const)
+                : node.rollback === 'fs-restore-modified'
+                ? (afterHash !== null && beforeHash && afterHash !== beforeHash && (!node.expectedHash || afterHash === node.expectedHash) ? 'EXPECTED_EFFECT' as const : afterHash === null ? 'NO_EFFECT' as const : beforeHash && afterHash === beforeHash ? 'NO_EFFECT' as const : 'UNEXPECTED_EFFECT' as const)
+                : node.rollback === 'fs-restore-deleted'
+                ? (afterHash === null && !!beforeContent ? 'EXPECTED_EFFECT' as const : 'UNEXPECTED_EFFECT' as const)
+                : afterHash !== null ? 'EXPECTED_EFFECT' as const : 'NO_EFFECT' as const,
               observedAt: clock(),
               errors: [],
             }],
@@ -907,6 +913,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           tx = transactionManager.transition(tx, 'ROLLING_BACK');
           await transactionStore.saveTransition(session.sessionId, 'EFFECT_STARTED', tx);
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of tx.operations) {
             if (op.recovery) {
               const recoveryResult = await executeRecovery({
@@ -914,6 +921,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                 target: op.recovery.target,
                 params: op.recovery.params,
               });
+              anyRecoveryExecuted = true;
               if (!recoveryResult.success) {
                 allRecovered = false;
                 session.transactionErrors.push(`Recovery failed for ${op.id} (${op.recovery.adapterId}): ${recoveryResult.error}`);
@@ -940,6 +948,11 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                 session.transactionErrors.push(`Recovery verification failed for ${op.id}: ${verifyError}`);
               }
             }
+          }
+          // §14: Fail closed on unknown recovery adapters
+          if (!anyRecoveryExecuted && allRecovered) {
+            allRecovered = false;
+            session.transactionErrors.push('Recovery failed: no recovery adapter executed (unknown adapter or missing descriptor)');
           }
           const terminalStatus: 'ROLLED_BACK' | 'ROLLBACK_FAILED' = allRecovered ? 'ROLLED_BACK' : 'ROLLBACK_FAILED';
           tx = transactionManager.transition(tx, terminalStatus);
@@ -1489,6 +1502,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (requiresRecovery) {
           // Execute recovery for interrupted transaction
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of tx.operations) {
             if (!op.recovery) continue;
             try {
@@ -1598,6 +1612,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         } else if (effectType === 'PARTIAL') {
           // Partial/unexpected effect — recover
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of tx.operations) {
             if (!op.recovery) continue;
             try {
@@ -1651,6 +1666,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (externalChanged) {
           // Unexpected effect in PREPARED/AUTHORIZED state — recover
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of tx.operations) {
             if (!op.recovery) continue;
             try {
@@ -2039,18 +2055,29 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       );
       for (const [txId, tx] of toProcess) {
         if (verificationPassed) {
-          // Verification passed � commit the transaction
-          // §10: Persist COMMIT immediately after VALIDATED — don't wait for PERSIST phase
-          const committedTx = transactionManager.commit(tx);
+          // §12: Transition through OBSERVED → VALIDATED → COMMITTED
+          let stagedTx = tx;
+          // Step 1: EFFECT_APPLIED → OBSERVED (skip if already OBSERVED)
+          if (stagedTx.status === 'EFFECT_APPLIED') {
+            stagedTx = transactionManager.transition(stagedTx, 'OBSERVED');
+            await transactionStore.saveTransition(currentSession.sessionId, 'EFFECT_APPLIED', stagedTx);
+          }
+          // Step 2: OBSERVED → VALIDATED
+          stagedTx = transactionManager.transition(stagedTx, 'VALIDATED');
+          await transactionStore.saveTransition(currentSession.sessionId, 'OBSERVED', stagedTx);
+          // Step 3: VALIDATED → COMMITTED (enforced by commit() state machine)
+          const committedTx = transactionManager.commit(stagedTx);
+          // §10: Persist COMMIT immediately — don't wait for PERSIST phase
           await transactionStore.saveTransition(currentSession.sessionId, 'VALIDATED', committedTx);
           currentSession.activeTransactions.delete(txId);
-          currentSession.completedTransactions.set(txId, committedTx);
+          currentSession.completedTransactions.set(txId, committedTx)
         } else if (verificationOrg) {
           // Verification organ exists but failed � rollback
           let rolledTx = transactionManager.transition(tx, "ROLLING_BACK");
           // Persist ROLLING_BACK before recovery execution (crash-safe)
           await transactionStore.saveTransition(currentSession.sessionId, tx.status, rolledTx);
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of rolledTx.operations) {
             if (op.recovery?.adapterId && op.recovery.adapterId !== "") {
               try {
@@ -2094,6 +2121,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           let rolledTx = transactionManager.transition(tx, 'ROLLING_BACK');
           await transactionStore.saveTransition(currentSession.sessionId, tx.status, rolledTx);
           let allRecovered = true;
+          let anyRecoveryExecuted = false;
           for (const op of rolledTx.operations) {
             if (op.recovery?.adapterId && op.recovery.adapterId !== '') {
               try {
