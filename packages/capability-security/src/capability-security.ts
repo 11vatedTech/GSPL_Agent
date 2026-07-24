@@ -60,7 +60,7 @@ export interface Capability {
   planId: string;
   actionId: string;
   intentId: string;
-  parameterHash?: string;
+  parameterHash: string;
   originatingIntentId?: string;
   delegationLineage: string[];
   issuanceEvidence?: Record<string, unknown>;
@@ -199,7 +199,7 @@ export interface CapabilityState {
   planId: string;
   actionId: string;
   intentId: string;
-  parameterHash?: string;
+  parameterHash: string;
   originatingIntentId?: string;
   delegationLineage: string[];
   issuanceEvidence?: Record<string, unknown>;
@@ -215,7 +215,7 @@ export interface CapabilityRequest {
   principalId?: string;
   sessionId?: string;
   planNodeId?: string;
-  parameterHash?: string;
+  parameterHash: string;
   originatingIntentId?: string;
 }
 
@@ -369,7 +369,7 @@ export interface CapabilityIssuanceRequest {
   planId?: string;
   actionId?: string;
   intentId?: string;
-  parameterHash?: string;
+  parameterHash: string;
   originatingIntentId?: string;
   issuanceRequestHash?: string;
   ttlMs?: number;

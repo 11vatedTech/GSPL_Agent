@@ -1228,9 +1228,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
             transactionId: txId,
             operationIds: [],
             observationIds: [],
-            validatorIds: results.map(r => r.validatorId ?? 'unnamed'),
+            validatorIds: results.map(r => r.verifiedBy),
             passed: allPassed,
-            evidenceIds: passedChecks.map(r => r.evidenceId ?? ''),
+            evidenceIds: passedChecks.map(r => r.evidence.length > 0 ? r.evidence[0].description : ''),
             expectedValues: { checkCount: results.length },
             observedValues: { passedCount: results.filter(r => r.passed).length, failedCount: results.filter(r => !r.passed).length },
             timestamp: clock(),
@@ -1431,10 +1431,63 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     // §7: Typed transaction store load — distinguish absent, loaded, and corrupted
     const durableLoadResult = await transactionStore.loadTransactions(agentId);
     const durableTransactions = durableLoadResult.kind === 'LOADED' ? durableLoadResult.state : null;
-    const txJournalErrors = durableLoadResult.kind === 'CORRUPTED' ? durableLoadResult.errors : [];
+    // §4-6: CORRUPTED and IO_ERROR journals MUST fail closed
     if (durableLoadResult.kind === 'CORRUPTED') {
-      recoveredTxErrors.push(...txJournalErrors.map(e => `Transaction journal corruption: ${e.code} — ${e.message}`));
+      recoveredTxErrors.push('FATAL: Transaction journal is corrupted, refusing to restore session');
+      recoveredTxErrors.push(...durableLoadResult.errors.map(e => `Corruption detail: ${e.code} — ${e.message}`));
+      sessionErrors.push({
+        code: 'TRANSACTION_JOURNAL_CORRUPTED',
+        message: `Transaction journal for agent ${agentId} is corrupted with ${durableLoadResult.errors.length} integrity errors`,
+        severity: 'FATAL',
+        timestamp: clock(),
+        source: 'restoreSession',
+      });
+      // §10: Merge and return all recovery errors
+      const mergedErrors = [...(txData?.transactionErrors ?? []), ...recoveredTxErrors];
+      return {
+        ...state,
+        agentId,
+        errors: [...coreErrors, ...sessionErrors, ...mergedErrors],
+        activeTransactions: new Map(),
+        completedTransactions: new Map(),
+        authorizationStates: new Map(),
+        authorityDecisions: new Map(),
+        approvalEvidence: new Map(),
+        recoveryJournals: [],
+        currentTransactionId: null,
+        transactionErrors: mergedErrors,
+        restoredWithErrors: true,
+      };
     }
+    
+    // §5: IO_ERROR must fail closed — never treat as absence
+    if (durableLoadResult.kind === 'IO_ERROR') {
+      recoveredTxErrors.push(`FATAL: Transaction journal I/O error: ${durableLoadResult.error.code} — ${durableLoadResult.error.message}`);
+      sessionErrors.push({
+        code: 'TRANSACTION_JOURNAL_IO_ERROR',
+        message: `Cannot read transaction journal for agent ${agentId}: ${durableLoadResult.error.message}`,
+        severity: 'FATAL',
+        timestamp: clock(),
+        source: 'restoreSession',
+      });
+      const mergedErrors = [...(txData?.transactionErrors ?? []), ...recoveredTxErrors];
+      return {
+        ...state,
+        agentId,
+        errors: [...coreErrors, ...sessionErrors, ...mergedErrors],
+        activeTransactions: new Map(),
+        completedTransactions: new Map(),
+        authorizationStates: new Map(),
+        authorityDecisions: new Map(),
+        approvalEvidence: new Map(),
+        recoveryJournals: [],
+        currentTransactionId: null,
+        transactionErrors: mergedErrors,
+        restoredWithErrors: true,
+      };
+    }
+    
+    const txJournalErrors: TransactionIntegrityError[] = [];
 
     const state = await persistence.load(agentId);
     if (!state) {
@@ -1675,7 +1728,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (effectType === 'COMPLETE') {
           // Complete effect — promote to EFFECT_APPLIED for verification-gated commit
           const promotedTx = { ...tx, status: 'EFFECT_APPLIED' as const };
-          await transactionStore.saveTransition(session.sessionId, tx.status, promotedTx);
+          await transactionStore.saveTransition(agentId, tx.status, promotedTx);
           recoveredActiveTx.set(txId, promotedTx);
         } else if (effectType === 'PARTIAL') {
           // Partial/unexpected effect — recover
@@ -1697,12 +1750,12 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           }
           const recoveredStatus = allRecovered ? ('ROLLED_BACK' as const) : ('ROLLBACK_FAILED' as const);
           const recoveredTx = { ...tx, status: recoveredStatus, completedAt: clock() };
-          await transactionStore.saveTransition(session.sessionId, tx.status, recoveredTx);
+          await transactionStore.saveTransition(agentId, tx.status, recoveredTx);
           completedTransactions.set(txId, recoveredTx);
         } else {
           // No effect — abort cleanly
           const abortedTx = { ...tx, status: 'ABORTED' as const, completedAt: clock() };
-          await transactionStore.saveTransition(session.sessionId, tx.status, abortedTx);
+          await transactionStore.saveTransition(agentId, tx.status, abortedTx);
           completedTransactions.set(txId, abortedTx);
         }
       } else if (tx.status === 'OBSERVED') {
@@ -1783,7 +1836,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
     }
     if (txData?.approvalEvidence) {
       for (const e of txData.approvalEvidence) {
-        if (e.id) restoredApprovalEvidence.set(e.id, e as any);
+        if ((e as any).evidenceId) restoredApprovalEvidence.set((e as any).evidenceId, e as any);
+        else if ((e as any).id) restoredApprovalEvidence.set((e as any).id, e as any);
       }
     }
 

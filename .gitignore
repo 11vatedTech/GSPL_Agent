@@ -10,3 +10,4 @@ coverage/
 .gspl-*-state/
 *.log
 tmp/
+output.txt

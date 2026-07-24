@@ -200,10 +200,17 @@ export interface TransactionIntegrityError {
   detail?: string;
 }
 
+export interface TransactionStoreIoError {
+  code: 'EACCES' | 'EIO' | 'EISDIR' | 'ENOSPC' | 'UNKNOWN';
+  message: string;
+  errno?: number;
+}
+
 export type TransactionStoreLoadResult =
   | { kind: 'ABSENT' }
   | { kind: 'LOADED'; state: { active: Transaction[]; completed: Transaction[] } }
-  | { kind: 'CORRUPTED'; errors: TransactionIntegrityError[] };
+  | { kind: 'CORRUPTED'; errors: TransactionIntegrityError[] }
+  | { kind: 'IO_ERROR'; error: TransactionStoreIoError };
 
 /** §2: Per-session durable transaction store — persists every transition atomically */
 export interface TransactionStore {
@@ -294,8 +301,12 @@ export function createTransactionStore(storagePath: string): TransactionStore {
       let raw: string;
       try {
         raw = await readFile(txPath(sessionId), 'utf-8');
-      } catch {
-        return { kind: 'ABSENT' };
+      } catch (e: any) {
+        // §5: Only ENOENT means absent. All other I/O errors are IO_ERROR.
+        if (e?.code === 'ENOENT') return { kind: 'ABSENT' };
+        const ioCode = (e?.code === 'EACCES' || e?.code === 'EIO' || e?.code === 'EISDIR' || e?.code === 'ENOSPC')
+          ? e.code as TransactionStoreIoError['code'] : 'UNKNOWN';
+        return { kind: 'IO_ERROR', error: { code: ioCode, message: e?.message ?? 'Unknown I/O error', errno: e?.errno } };
       }
 
       let parsed: any;
