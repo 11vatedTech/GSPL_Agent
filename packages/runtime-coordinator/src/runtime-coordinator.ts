@@ -800,12 +800,20 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           session.activeTransactions.set(tx.id, tx);
         }
 
-        // If we skipped the AUTHORIZED transition above (no preflight auth state), do it now
+        // §5: Never mark missing authority as AUTHORIZED — abort if no accepted authority decision
         if (!hasAuthState) {
-          tx = transactionManager.transition(tx, 'AUTHORIZED');
+          tx = transactionManager.abort(tx);
           await transactionStore.saveTransition(session.sessionId, 'PREPARED', tx);
-          await transactionFailureHooks?.afterAuthorizedPersist?.();
-          session.activeTransactions.set(tx.id, tx);
+          session.activeTransactions.delete(tx.id);
+          session.completedTransactions.set(tx.id, tx);
+          session.currentTransactionId = null;
+          node.status = 'FAILED';
+          return {
+            output: { executed: false, planNodeId: node.id, reason: 'Missing authorization state — cannot execute without an accepted authority decision' },
+            confidence: 0, evidence: [],
+            errors: [{ code: 'MISSING_AUTHORIZATION', message: 'Cannot execute plan node without authorization state. The authority request must succeed before execution.', severity: 'fatal', recoverable: false }],
+            consumedResources: { computeUnits: 1, memoryBytes: 0 },
+          };
         }
 
         // §4: Transition to EFFECT_STARTED before adapter invocation
@@ -1365,6 +1373,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   // ── Restore Session ──
 
   async function restoreSession(agentId: string): Promise<AgentSession> {
+    // §6: Load durable transaction store as the source of truth BEFORE session snapshot
+    const durableTransactions = await transactionStore.loadTransactions(agentId);
+
     const state = await persistence.load(agentId);
     if (!state) {
       throw new Error(`No persisted state found for agent ${agentId}`);
@@ -1907,19 +1918,31 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                         authorityVerifier,
                       );
                       if (!acceptResult.accepted) {
+                        // §1: Reject rejected decisions completely — no authorization state created
+                        node.status = 'FAILED';
                         observability.log({ level: 'WARN', source: 'runtime-coordinator', message: 'Authority decision rejected: ' + acceptResult.reason, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, reason: acceptResult.reason } });
+                        continue;
                       }
-                      // §7: Store authorization records in typed Map
-                      nodeAuthState.set(node.id, {
+                      // §1+§2: Accepted authority decision — store in BOTH session-owned and closure-global maps
+                      const authState: PlanNodeAuthorizationState = {
                         capabilityId: decision.capability.id,
                         approvalEvidenceId: decision.approvalEvidence?.id ?? null,
-                        authorityDecisionId: (decision as any).id ?? decision.approvalEvidence?.id ?? '',
+                        authorityDecisionId: decision.decisionId,
                         issuanceRequestHash: issuanceHash,
                         providerId: authorityProvider.providerId,
                         authorizedAt: clock(),
-                      });
+                      };
+                      // §2: Populate session-owned authorization state
+                      currentSession.authorizationStates.set(node.id, authState);
+                      currentSession.authorityDecisions.set(decision.decisionId, decision);
+                      currentSession.approvalEvidence.set(decision.approvalEvidence.id, decision.approvalEvidence);
+                      // Legacy: also populate closure-global nodeAuthState (migration path)
+                      nodeAuthState.set(node.id, authState);
                     } else {
+                      // §1: Denied decisions get no authorization state
+                      node.status = 'FAILED';
                       observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Capability denied by authority: ${decision.decision === 'DENIED' ? decision.reason : 'requires owner approval'}`, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, decision: decision.decision } });
+                      continue;
                     }
                   } catch (e) {
                     observability.log({ level: 'WARN', source: 'runtime-coordinator', message: 'Capability issuance failed', sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { error: e instanceof Error ? e.message : 'unknown', planNodeId: node.id } });
@@ -2017,7 +2040,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       for (const [txId, tx] of toProcess) {
         if (verificationPassed) {
           // Verification passed � commit the transaction
+          // §10: Persist COMMIT immediately after VALIDATED — don't wait for PERSIST phase
           const committedTx = transactionManager.commit(tx);
+          await transactionStore.saveTransition(currentSession.sessionId, 'VALIDATED', committedTx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, committedTx);
         } else if (verificationOrg) {

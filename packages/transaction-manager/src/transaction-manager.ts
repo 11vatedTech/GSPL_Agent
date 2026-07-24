@@ -369,6 +369,9 @@ export function createTransactionManager(config?: TransactionManagerConfig): Tra
     },
 
     commit(tx) {
+      // §9: commit() must reject every state except VALIDATED
+      const violation = validateTransactionTransition(tx.status, 'COMMITTED');
+      if (violation) throw new Error(violation);
       return { ...tx, status: 'COMMITTED' as const, completedAt: Date.now() };
     },
 

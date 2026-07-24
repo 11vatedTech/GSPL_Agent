@@ -30,7 +30,13 @@ describe('Transaction Manager', () => {
 
   it('commits a transaction', () => {
     const tx = tm.beginTransaction('test');
-    const committed = tm.commit(tx);
+    // §9: commit() requires VALIDATED — transition through full lifecycle
+    const authorized = tm.transition(tx, 'AUTHORIZED');
+    const started = tm.transition(authorized, 'EFFECT_STARTED');
+    const applied = tm.transition(started, 'EFFECT_APPLIED');
+    const observed = tm.transition(applied, 'OBSERVED');
+    const validated = tm.transition(observed, 'VALIDATED');
+    const committed = tm.commit(validated);
     expect(committed.status).toBe('COMMITTED');
   });
 

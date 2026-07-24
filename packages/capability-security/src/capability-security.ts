@@ -737,8 +737,21 @@ export function createCapabilityManager(policy: PolicyValue): CapabilityManager 
       if (context.canonicalParameterHash && cap.parameterHash && context.canonicalParameterHash !== cap.parameterHash) {
         return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PARAMETER_MISMATCH', reason: `Parameter hash mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
       }
+      // §3: Validate canonical target
+      if (context.canonicalTarget && cap.binding?.canonicalTarget && context.canonicalTarget !== cap.binding.canonicalTarget) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'TARGET_MISMATCH', reason: `Target mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      // §3: Validate issuance request hash
+      if (context.issuanceRequestHash && cap.issuanceEvidence && (cap.issuanceEvidence as any).requestHash !== context.issuanceRequestHash) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'INVALID_ISSUER', reason: `Issuance request hash mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
+      // §3: Validate provider identity
+      if (context.providerId && cap.issuanceEvidence && (cap.issuanceEvidence as any).issuer !== context.providerId) {
+        return { authorized: false, policyDecision: 'ALLOW', capabilityDecision: 'PROVIDER_MISMATCH', reason: `Provider mismatch`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      }
 
-      return { authorized: true, policyDecision: 'ALLOW', capabilityDecision: 'MATCHED', reason: `Granted: ${cap.name}`, requiredApproval: false, matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
+      // §4: Preserve REQUIRE_APPROVAL policyDecision instead of rewriting to ALLOW
+      return { authorized: true, policyDecision: policyDecision === 'REQUIRE_APPROVAL' ? 'REQUIRE_APPROVAL' : 'ALLOW', capabilityDecision: 'MATCHED', reason: `Granted: ${cap.name}`, requiredApproval: policyDecision === 'REQUIRE_APPROVAL', matchedRule, matchedRuleId: matchedRule?.id, matchedCapabilityId: cap.id };
     },
 
     delegate(capabilityId, to, attenuations) {
