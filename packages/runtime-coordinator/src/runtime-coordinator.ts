@@ -147,6 +147,8 @@ export interface AgentSession {
   authorizationStates: Map<string, PlanNodeAuthorizationState>;
   authorityDecisions: Map<string, import('@gspl/capability-security').ApprovedCapabilityDecision>;
   approvalEvidence: Map<string, import('@gspl/capability-security').ApprovalEvidence>;
+  /** §13: Transaction-specific verification results */
+  transactionVerifications: Map<string, TransactionVerificationResult>;
 }
 
 export interface AgentSessionError {
@@ -188,6 +190,21 @@ export interface PlanNodeAuthorizationState {
   issuanceRequestHash: string;
   providerId: string;
   authorizedAt: number;
+}
+
+// ── §13: Transaction Verification Result ──
+// Per-transaction verification record replacing single global boolean
+
+export interface TransactionVerificationResult {
+  transactionId: string;
+  operationIds: string[];
+  observationIds: string[];
+  validatorIds: string[];
+  passed: boolean;
+  evidenceIds: string[];
+  expectedValues: Record<string, unknown>;
+  observedValues: Record<string, unknown>;
+  timestamp: number;
 }
 
 // §12: Explicit test policy with standard filesystem ALLOW rules at high priority
@@ -1199,6 +1216,23 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       }
 
       const allPassed = results.length > 0 && results.every(r => r.passed);
+      // §13: Populate transaction-specific verification results
+      for (const [txId] of session.activeTransactions) {
+        if (!session.transactionVerifications.has(txId)) {
+          const passedChecks = results.filter(r => r.passed);
+          session.transactionVerifications.set(txId, {
+            transactionId: txId,
+            operationIds: [],
+            observationIds: [],
+            validatorIds: results.map(r => r.validatorId ?? 'unnamed'),
+            passed: allPassed,
+            evidenceIds: passedChecks.map(r => r.evidenceId ?? ''),
+            expectedValues: { checkCount: results.length },
+            observedValues: { passedCount: results.filter(r => r.passed).length, failedCount: results.filter(r => !r.passed).length },
+            timestamp: clock(),
+          });
+        }
+      }
       return {
         output: {
           verified: allPassed,
@@ -1380,6 +1414,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       authorizationStates: new Map(),
       authorityDecisions: new Map(),
       approvalEvidence: new Map(),
+      transactionVerifications: new Map(),
     };
   }
 
@@ -1756,8 +1791,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       // §4: Session-owned authorization state — restored from persistence
       authorizationStates: restoredAuthStates,
       authorityDecisions: restoredAuthorityDecisions,
-      approvalEvidence: restoredApprovalEvidence,
-    };
+  approvalEvidence: restoredApprovalEvidence,
+  transactionVerifications: new Map(),
+};
   }
 
   function submitObjective(session: AgentSession, objective: string): AgentSession {
