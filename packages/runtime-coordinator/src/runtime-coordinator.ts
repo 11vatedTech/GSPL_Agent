@@ -1740,17 +1740,29 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
       }
     }
 
-    // Restore authority decisions and approval evidence from persisted data
+    // §15: Restore authority decisions and approval evidence from persisted data
     const restoredAuthorityDecisions = new Map<string, import('@gspl/capability-security').ApprovedCapabilityDecision>();
     const restoredApprovalEvidence = new Map<string, import('@gspl/capability-security').ApprovalEvidence>();
+    if (txData?.authorityDecisions) {
+      for (const d of txData.authorityDecisions) {
+        if (d.decisionId) restoredAuthorityDecisions.set(d.decisionId, d as any);
+      }
+    }
+    if (txData?.approvalEvidence) {
+      for (const e of txData.approvalEvidence) {
+        if (e.id) restoredApprovalEvidence.set(e.id, e as any);
+      }
+    }
 
-    // §11: Validate and restore currentTransactionId
-    const restoredCurrentTxId: string | null = txData?.currentTransactionId ?? null;
+    // §16: Validate and restore currentTransactionId — null on invalid reference
+    let restoredCurrentTxId: string | null = txData?.currentTransactionId ?? null;
     if (restoredCurrentTxId !== null) {
-      // Validate the referenced transaction exists and is active
       const txExists = recoveredActiveTx.has(restoredCurrentTxId);
       if (!txExists) {
-        observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Persisted currentTransactionId ${restoredCurrentTxId} not found in active transactions — clearing`, sessionId: state.agentId, tickNumber: restoredTick, correlationId: '', data: {} });
+        // §16: Invalid — referenced transaction not in active set. Clear and record recovery error.
+        observability.log({ level: 'WARN', source: 'runtime-coordinator', message: `Persisted currentTransactionId ${restoredCurrentTxId} not found in active transactions — clearing and recording recovery error`, sessionId: state.agentId, tickNumber: restoredTick, correlationId: '', data: {} });
+        restoredCurrentTxId = null;
+        recoveredTxErrors.push(`Corrupted state: persisted currentTransactionId ${txData!.currentTransactionId} references non-existent transaction`);
       }
     }
 
@@ -2090,7 +2102,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         ([_, tx]) => tx.status === "EFFECT_APPLIED" || tx.status === "OBSERVED"
       );
       for (const [txId, tx] of toProcess) {
-        if (verificationPassed) {
+        // §13: Per-transaction verification — one tx success never commits unrelated txs
+        const txVerification = currentSession.transactionVerifications.get(txId);
+        const txVerified = txVerification?.passed === true;
+        if (verificationPassed && txVerified) {
           // §12: Transition through OBSERVED → VALIDATED → COMMITTED
           let stagedTx = tx;
           // Step 1: EFFECT_APPLIED → OBSERVED (skip if already OBSERVED)
