@@ -984,6 +984,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
         if (isTerminal) {
           session.activeTransactions.delete(tx.id);
           session.completedTransactions.set(tx.id, tx);
+          // §17: Clear currentTransactionId when its transaction becomes terminal
+          if (session.currentTransactionId === tx.id) {
+            session.currentTransactionId = null;
+          }
         } else {
           session.activeTransactions.set(tx.id, tx);
         }
@@ -1421,8 +1425,16 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   // ── Restore Session ──
 
   async function restoreSession(agentId: string): Promise<AgentSession> {
+    // §7: Collect transaction integrity errors during restoration
+    const recoveredTxErrors: string[] = [];
     // §6: Load durable transaction store as the source of truth BEFORE session snapshot
-    const durableTransactions = await transactionStore.loadTransactions(agentId);
+    // §7: Typed transaction store load — distinguish absent, loaded, and corrupted
+    const durableLoadResult = await transactionStore.loadTransactions(agentId);
+    const durableTransactions = durableLoadResult.kind === 'LOADED' ? durableLoadResult.state : null;
+    const txJournalErrors = durableLoadResult.kind === 'CORRUPTED' ? durableLoadResult.errors : [];
+    if (durableLoadResult.kind === 'CORRUPTED') {
+      recoveredTxErrors.push(...txJournalErrors.map(e => `Transaction journal corruption: ${e.code} — ${e.message}`));
+    }
 
     const state = await persistence.load(agentId);
     if (!state) {
@@ -2142,7 +2154,11 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           // §10: Persist COMMIT immediately — don't wait for PERSIST phase
           await transactionStore.saveTransition(currentSession.sessionId, 'VALIDATED', committedTx);
           currentSession.activeTransactions.delete(txId);
-          currentSession.completedTransactions.set(txId, committedTx)
+          currentSession.completedTransactions.set(txId, committedTx);
+          // §17: Clear currentTransactionId when its transaction becomes terminal
+          if (currentSession.currentTransactionId === txId) {
+            currentSession.currentTransactionId = null;
+          }
         } else if (verificationOrg) {
           // Verification organ exists but failed � rollback
           let rolledTx = transactionManager.transition(tx, "ROLLING_BACK");
@@ -2171,6 +2187,10 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           await transactionStore.saveTransition(currentSession.sessionId, "ROLLING_BACK", rolledTx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, rolledTx);
+          // §17: Clear currentTransactionId when its transaction becomes terminal
+          if (currentSession.currentTransactionId === txId) {
+            currentSession.currentTransactionId = null;
+          }
           if (allRecovered) {
             currentSession.transactionErrors.push(
               `Transaction ${txId}: rolled back successfully after verification failure`
@@ -2186,6 +2206,9 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
           await transactionStore.saveTransition(currentSession.sessionId, tx.status, abortedTx);
           currentSession.activeTransactions.delete(txId);
           currentSession.completedTransactions.set(txId, abortedTx);
+          if (currentSession.currentTransactionId === txId) {
+            currentSession.currentTransactionId = null;
+          }
           currentSession.transactionErrors.push(
             `Transaction ${txId}: ABORTED: no VERIFICATION organ for EFFECT_APPLIED`
           );

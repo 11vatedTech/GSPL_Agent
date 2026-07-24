@@ -193,11 +193,24 @@ export interface TransactionManager {
   validateCheckpoint(checkpoint: Checkpoint): boolean;
 }
 
+// §7: Typed load result — distinguish absent, loaded, and corrupted journals
+export interface TransactionIntegrityError {
+  code: 'SCHEMA_VERSION_MISMATCH' | 'HASH_MISMATCH' | 'UNKNOWN_STATUS' | 'UNKNOWN_OPERATION_TYPE' | 'UNKNOWN_RECOVERY_ADAPTER' | 'DUPLICATE_TRANSACTION_ID' | 'PARSE_ERROR';
+  message: string;
+  detail?: string;
+}
+
+export type TransactionStoreLoadResult =
+  | { kind: 'ABSENT' }
+  | { kind: 'LOADED'; state: { active: Transaction[]; completed: Transaction[] } }
+  | { kind: 'CORRUPTED'; errors: TransactionIntegrityError[] };
+
 /** §2: Per-session durable transaction store — persists every transition atomically */
 export interface TransactionStore {
   savePrepared(sessionId: string, tx: Transaction): Promise<void>;
   saveTransition(sessionId: string, previous: TransactionStatus, next: Transaction): Promise<void>;
-  loadTransactions(sessionId: string): Promise<{ active: Transaction[]; completed: Transaction[] } | null>;
+  /** §7: Returns typed result — ABSENT, LOADED, or CORRUPTED. Never null for both absence and corruption. */
+  loadTransactions(sessionId: string): Promise<TransactionStoreLoadResult>;
   deleteTransactionState(sessionId: string): Promise<void>;
 }
 
@@ -275,44 +288,76 @@ export function createTransactionStore(storagePath: string): TransactionStore {
       await atomicWrite(txPath(sessionId), serializeTransactions(existing.active, existing.completed));
     },
 
-    /** §2: Harden load with integrity verification and schema validation */
-    async loadTransactions(sessionId) {
+    /** §2 & §7: Harden load with integrity verification and schema validation.
+     *  Returns typed result: ABSENT (no journal), LOADED (valid), or CORRUPTED (recoverable). */
+    async loadTransactions(sessionId): Promise<TransactionStoreLoadResult> {
+      let raw: string;
       try {
-        const raw = await readFile(txPath(sessionId), 'utf-8');
-        const parsed = JSON.parse(raw);
-        // §18: Validate schema structure
-        if (parsed.schemaVersion !== 1) return null;
-        // Verify content hash
-        if (parsed.contentHash) {
-          const { contentHash: storedHash, ...rest } = parsed;
-          const recomputed = sha256(JSON.stringify(rest));
-          if (storedHash !== recomputed) return null; // Corrupted — refuse to load
+        raw = await readFile(txPath(sessionId), 'utf-8');
+      } catch {
+        return { kind: 'ABSENT' };
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return { kind: 'CORRUPTED', errors: [{ code: 'PARSE_ERROR', message: 'Transaction journal is not valid JSON' }] };
+      }
+
+      const errors: TransactionIntegrityError[] = [];
+
+      // §18: Validate schema structure
+      if (parsed.schemaVersion !== 1) {
+        errors.push({ code: 'SCHEMA_VERSION_MISMATCH', message: `Unknown schema version: ${parsed.schemaVersion}`, detail: String(parsed.schemaVersion) });
+      }
+
+      // Verify content hash
+      if (parsed.contentHash) {
+        const { contentHash: storedHash, ...rest } = parsed;
+        const recomputed = sha256(JSON.stringify(rest));
+        if (storedHash !== recomputed) {
+          errors.push({ code: 'HASH_MISMATCH', message: 'Transaction journal content hash mismatch — data may be corrupted' });
         }
-        // Validate each transaction has known statuses
-        const allTxns = [...(parsed.active ?? []), ...(parsed.completed ?? [])];
-        const knownStatuses: TransactionStatus[] = [
-          'PREPARED', 'AUTHORIZED', 'ACTIVE', 'EFFECT_STARTED', 'EFFECT_APPLIED',
-          'OBSERVED', 'VALIDATED', 'COMMITTING', 'COMMITTED', 'ROLLING_BACK',
-          'ROLLED_BACK', 'PARTIALLY_ROLLED_BACK', 'ROLLBACK_FAILED',
-          'COMPENSATING', 'COMPENSATED', 'PARTIALLY_COMPENSATED', 'COMPENSATION_FAILED', 'ABORTED'
-        ];
-        const knownOperationTypes = ['create', 'modify', 'delete', 'read', 'write'];
-        const knownRecoveryAdapters = ['fs-remove-created', 'fs-restore-modified', 'fs-restore-deleted', ''];
-        for (const tx of allTxns) {
-          if (!knownStatuses.includes(tx.status)) return null;
-          // Validate operation types
-          if (tx.operations) {
-            for (const op of tx.operations) {
-              if (op.type && !knownOperationTypes.includes(op.type)) return null;
-              if (op.recovery?.adapterId && !knownRecoveryAdapters.includes(op.recovery.adapterId)) return null;
+      }
+
+      // Validate each transaction has known statuses
+      const allTxns = [...(parsed.active ?? []), ...(parsed.completed ?? [])];
+      const knownStatuses: TransactionStatus[] = [
+        'PREPARED', 'AUTHORIZED', 'ACTIVE', 'EFFECT_STARTED', 'EFFECT_APPLIED',
+        'OBSERVED', 'VALIDATED', 'COMMITTING', 'COMMITTED', 'ROLLING_BACK',
+        'ROLLED_BACK', 'PARTIALLY_ROLLED_BACK', 'ROLLBACK_FAILED',
+        'COMPENSATING', 'COMPENSATED', 'PARTIALLY_COMPENSATED', 'COMPENSATION_FAILED', 'ABORTED'
+      ];
+      const knownOperationTypes = ['create', 'modify', 'delete', 'read', 'write'];
+      const knownRecoveryAdapters = ['fs-remove-created', 'fs-restore-modified', 'fs-restore-deleted', ''];
+
+      const seenIds = new Set<string>();
+      for (const tx of allTxns) {
+        if (!knownStatuses.includes(tx.status)) {
+          errors.push({ code: 'UNKNOWN_STATUS', message: `Unknown transaction status: ${tx.status}`, detail: tx.id });
+        }
+        if (tx.operations) {
+          for (const op of tx.operations) {
+            if (op.type && !knownOperationTypes.includes(op.type)) {
+              errors.push({ code: 'UNKNOWN_OPERATION_TYPE', message: `Unknown operation type: ${op.type}`, detail: `${tx.id}/${op.id}` });
+            }
+            if (op.recovery?.adapterId && !knownRecoveryAdapters.includes(op.recovery.adapterId) && op.recovery.adapterId !== '') {
+              errors.push({ code: 'UNKNOWN_RECOVERY_ADAPTER', message: `Unknown recovery adapter: ${op.recovery.adapterId}`, detail: `${tx.id}/${op.id}` });
             }
           }
-          // Check for duplicate IDs
-          const sameId = allTxns.filter(t => t.id === tx.id);
-          if (sameId.length > 1) return null;
         }
-        return { active: parsed.active ?? [], completed: parsed.completed ?? [] };
-      } catch { return null; }
+        if (seenIds.has(tx.id)) {
+          errors.push({ code: 'DUPLICATE_TRANSACTION_ID', message: `Duplicate transaction ID: ${tx.id}` });
+        }
+        seenIds.add(tx.id);
+      }
+
+      if (errors.length > 0) {
+        return { kind: 'CORRUPTED', errors };
+      }
+
+      return { kind: 'LOADED', state: { active: parsed.active ?? [], completed: parsed.completed ?? [] } };
     },
 
     async deleteTransactionState(sessionId) {
