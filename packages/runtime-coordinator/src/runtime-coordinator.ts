@@ -29,7 +29,7 @@ import { compileIntent, type CompiledIntent } from '@gspl/intent-compiler';
 import { createEpistemicEngine, type EpistemicEngine } from '@gspl/epistemic-engine';
 import type { PolicyValue } from '@gspl/agent-genes';
 import { createMemoryStore, type MemoryStore } from '@gspl/memory-architecture';
-import { createCapabilityManager, createTestAuthorityProvider, createTestAuthorityVerifier, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type AuthorityVerifier, type CapabilityScope, type ApprovedCapabilityDecision, type ApprovalEvidence } from '@gspl/capability-security';
+import { createCapabilityManager, createTestAuthorityProvider, createTestAuthorityVerifier, canonicalHash, computeIssuanceRequestHash, type CapabilityManager, type EffectType, type AuthorityProvider, type AuthorityVerifier, type CapabilityScope, type CapabilityIssuanceEnvelope, type ApprovedCapabilityDecision, type ApprovalEvidence } from '@gspl/capability-security';
 import { createWorld, discoverAbsences, type SemanticWorld } from '@gspl/world-model';
 import { createActionRegistry, createActionExecutor, registerStandardActions, type ActionRegistry, type ActionExecutor, type ActionAuthorizationContext } from '@gspl/action-fabric';
 import { createTransactionManager, type TransactionManager, type TransactionStore, createTransactionStore } from '@gspl/transaction-manager';
@@ -90,6 +90,7 @@ export interface RuntimeDependencies {
   /** §1: External authority provider — required trust boundary for capability issuance */
   authorityProvider: AuthorityProvider;
   /** §9: Trusted authority verifier — validates provider identity and decision proofs */
+  authorityVerifier: AuthorityVerifier;
   persistence: PersistenceLayer;
   eventStore: EventStore;
   observability: ObservabilitySystem;
@@ -211,7 +212,7 @@ export function createTestRuntimeCoordinator(overrides?: Partial<RuntimeDependen
   registerStandardActions(baseRegistry);
   return createRuntimeCoordinator({
     authorityProvider: createTestAuthorityProvider(baseGenerateId),
-    authorityVerifier: createTestAuthorityVerifier(baseGenerateId('test-auth')),
+    authorityVerifier: createTestAuthorityVerifier('test-authority'),
     persistence: createPersistenceLayer({ storagePath: join(tmpdir(), 'gspl-test-state-' + baseGenerateId('persist')), schemaVersion: 2, backupEnabled: false, maxBackupCount: 1, compressionEnabled: false }),
     eventStore: createEventStore(),
     observability: createObservabilitySystem(),
@@ -258,6 +259,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
   // §1: Authority provider — required trust boundary
   const authorityProvider: AuthorityProvider = deps.authorityProvider;
   // §9: Authority verifier — validates provider identity and proofs
+  const authorityVerifier: AuthorityVerifier = deps.authorityVerifier;
   const planExecutor = createPlanExecutor();
 
   registerStandardActions(actionRegistry);
@@ -1863,7 +1865,7 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       node.actionParams,
                     );
                     // §6: Independent issuance hash — build envelope, compute before calling provider
-                    const issuanceHash = computeIssuanceRequestHash({
+                    const issuanceEnvelope: CapabilityIssuanceEnvelope = {
                       version: 1,
                       providerId: authorityProvider.providerId,
                       principalId: currentSession.sessionId,
@@ -1881,7 +1883,8 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       reversibility: node.reversibility ?? 'reversible',
                       requiresApproval: node.requiresApproval ?? false,
                       requestedTtlMs: null,
-                    });
+                    };
+                    const issuanceHash = computeIssuanceRequestHash(issuanceEnvelope);
                     const decision = await authorityProvider.requestCapability({
                       name: node.id,
                       effectType: capReq.effectType,
@@ -1897,11 +1900,15 @@ export function createRuntimeCoordinator(deps: RuntimeDependencies & { config?: 
                       originatingIntentId: currentSession.compiledIntent?.intent.goal,
                     }, issuanceHash);
                     if (decision.decision === 'APPROVED') {
-                      currentSession.capabilityManager.acceptIssuedCapability(
-                        decision.capability,
-                        decision.approvalEvidence,
-                        decision.approvalEvidence.requestHash,
+                      const acceptResult = currentSession.capabilityManager.acceptAuthorityDecision(
+                        issuanceEnvelope,
+                        issuanceHash,
+                        decision,
+                        authorityVerifier,
                       );
+                      if (!acceptResult.accepted) {
+                        observability.log({ level: 'WARN', source: 'runtime-coordinator', message: 'Authority decision rejected: ' + acceptResult.reason, sessionId: currentSession.sessionId, tickNumber: currentSession.tick, correlationId: '', data: { planNodeId: node.id, reason: acceptResult.reason } });
+                      }
                       // §7: Store authorization records in typed Map
                       nodeAuthState.set(node.id, {
                         capabilityId: decision.capability.id,
